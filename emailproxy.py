@@ -6,7 +6,7 @@
 __author__ = 'Simon Robinson'
 __copyright__ = 'Copyright (c) 2023 Simon Robinson'
 __license__ = 'Apache 2.0'
-__version__ = '2023-05-18'  # ISO 8601 (YYYY-MM-DD)
+__version__ = '2023-07-14'  # ISO 8601 (YYYY-MM-DD)
 
 import abc
 import argparse
@@ -18,6 +18,7 @@ import datetime
 import enum
 import errno
 import io
+import ipaddress
 import json
 import logging
 import logging.handlers
@@ -158,6 +159,7 @@ REQUEST_QUEUE = queue.Queue()  # requests for authentication
 RESPONSE_QUEUE = queue.Queue()  # responses from user
 WEBVIEW_QUEUE = queue.Queue()  # authentication window events (macOS only)
 QUEUE_SENTINEL = object()  # object to send to signify queues should exit loops
+MENU_UPDATE = object()  # object to send to trigger a force-refresh of the GUI menu (new catch-all account added)
 
 PLIST_FILE_PATH = pathlib.Path('~/Library/LaunchAgents/%s.plist' % APP_PACKAGE).expanduser()  # launchctl file location
 CMD_FILE_PATH = pathlib.Path('~/AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Startup/%s.cmd' %
@@ -273,6 +275,14 @@ class Log:
     @staticmethod
     def error_string(error):
         return getattr(error, 'message', repr(error))
+
+    @staticmethod
+    def format_host_port(address):
+        host, port, *_ = address
+        with contextlib.suppress(ValueError):
+            ip = ipaddress.ip_address(host)
+            host = '[%s]' % host if type(ip) is ipaddress.IPv6Address else host
+        return '%s:%d' % (host, port)
 
     @staticmethod
     def get_last_error():
@@ -672,6 +682,7 @@ class OAuth2Helper:
                 access_token = response['access_token']
                 if not config.has_section(username):
                     AppConfig.add_account(username)  # in wildcard mode the section may not yet exist
+                    REQUEST_QUEUE.put(MENU_UPDATE)  # make sure the menu shows the newly-added account
                 config.set(username, 'token_salt', token_salt)
                 config.set(username, 'access_token', OAuth2Helper.encrypt(fernet, access_token))
                 config.set(username, 'access_token_expiry', str(current_time + response['expires_in']))
@@ -757,13 +768,13 @@ class OAuth2Helper:
         redirect_listen_type = 'redirect_listen_address' if token_request['redirect_listen_address'] else 'redirect_uri'
         parsed_uri = urllib.parse.urlparse(token_request[redirect_listen_type])
         parsed_port = 80 if parsed_uri.port is None else parsed_uri.port
-        Log.debug('Local server auth mode (%s:%d): starting server to listen for authentication response' % (
-            parsed_uri.hostname, parsed_port))
+        Log.debug('Local server auth mode (%s): starting server to listen for authentication response' %
+                  Log.format_host_port((parsed_uri.hostname, parsed_port)))
 
         class LoggingWSGIRequestHandler(wsgiref.simple_server.WSGIRequestHandler):
             def log_message(self, _format_string, *args):
-                Log.debug('Local server auth mode (%s:%d): received authentication response' % (
-                    parsed_uri.hostname, parsed_port), *args)
+                Log.debug('Local server auth mode (%s): received authentication response' % Log.format_host_port(
+                    (parsed_uri.hostname, parsed_port)), *args)
 
         class RedirectionReceiverWSGIApplication:
             def __call__(self, environ, start_response):
@@ -789,20 +800,22 @@ class OAuth2Helper:
                 redirection_server.server_close()
 
             if 'response_url' in token_request:
-                Log.debug('Local server auth mode (%s:%d): closing local server and returning response' % (
-                    parsed_uri.hostname, parsed_port), token_request['response_url'])
+                Log.debug('Local server auth mode (%s): closing local server and returning response' %
+                          Log.format_host_port((parsed_uri.hostname, parsed_port)), token_request['response_url'])
             else:
                 # failed, likely because of an incorrect address (e.g., https vs http), but can also be due to timeout
-                Log.info('Local server auth mode (%s:%d):' % (parsed_uri.hostname, parsed_port), 'request failed - if',
-                         'this error reoccurs, please check `%s` for' % redirect_listen_type, token_request['username'],
-                         'is not specified as `https` mistakenly. See the sample configuration file for documentation')
+                Log.info('Local server auth mode (%s):' % Log.format_host_port((parsed_uri.hostname, parsed_port)),
+                         'request failed - if this error reoccurs, please check `%s` for' % redirect_listen_type,
+                         token_request['username'], 'is not specified as `https` mistakenly. See the sample '
+                                                    'configuration file for documentation')
                 token_request['expired'] = True
 
         except socket.error as e:
-            Log.error('Local server auth mode (%s:%d):' % (parsed_uri.hostname, parsed_port), 'unable to start local',
-                      'server. Please check that `%s` for %s is unique across accounts, specifies a port number, and '
-                      'is not already in use. See the documentation in the proxy\'s sample configuration file.' % (
-                          redirect_listen_type, token_request['username']), Log.error_string(e))
+            Log.error('Local server auth mode (%s):' % Log.format_host_port((parsed_uri.hostname, parsed_port)),
+                      'unable to start local server. Please check that `%s` for %s is unique across accounts, '
+                      'specifies a port number, and is not already in use. See the documentation in the proxy\'s '
+                      'sample configuration file.' % (redirect_listen_type, token_request['username']),
+                      Log.error_string(e))
             token_request['expired'] = True
 
         del token_request['local_server_auth']
@@ -1113,11 +1126,11 @@ class OAuth2ClientConnection(SSLAsyncoreDispatcher):
             bool(custom_configuration['local_certificate_path'] and custom_configuration['local_key_path']))
 
     def info_string(self):
-        debug_string = '; %s:%d->%s:%d' % (self.connection_info[0], self.connection_info[1], self.server_address[0],
-                                           self.server_address[1]) if Log.get_level() == logging.DEBUG else ''
+        debug_string = '; %s->%s' % (Log.format_host_port(self.connection_info), Log.format_host_port(
+            self.server_address)) if Log.get_level() == logging.DEBUG else ''
         account = '; %s' % self.server_connection.authenticated_username if \
             self.server_connection and self.server_connection.authenticated_username else ''
-        return '%s (%s:%d%s%s)' % (self.proxy_type, self.local_address[0], self.local_address[1], debug_string, account)
+        return '%s (%s%s%s)' % (self.proxy_type, Log.format_host_port(self.local_address), debug_string, account)
 
     def handle_read(self):
         byte_data = self.recv(RECEIVE_BUFFER_SIZE)
@@ -1520,10 +1533,10 @@ class OAuth2ServerConnection(SSLAsyncoreDispatcher):
             return
 
     def info_string(self):
-        debug_string = '; %s:%d->%s:%d' % (self.connection_info[0], self.connection_info[1], self.server_address[0],
-                                           self.server_address[1]) if Log.get_level() == logging.DEBUG else ''
+        debug_string = '; %s->%s' % (Log.format_host_port(self.connection_info), Log.format_host_port(
+            self.server_address)) if Log.get_level() == logging.DEBUG else ''
         account = '; %s' % self.authenticated_username if self.authenticated_username else ''
-        return '%s (%s:%d%s%s)' % (self.proxy_type, self.local_address[0], self.local_address[1], debug_string, account)
+        return '%s (%s%s%s)' % (self.proxy_type, Log.format_host_port(self.local_address), debug_string, account)
 
     def handle_connect(self):
         Log.debug(self.info_string(), '--> [ Client connected ]')
@@ -1860,9 +1873,9 @@ class OAuth2Proxy(asyncore.dispatcher):
         self.client_connections = []
 
     def info_string(self):
-        return '%s server at %s:%d (%s) proxying %s:%d (%s)' % (
-            self.proxy_type, self.local_address[0], self.local_address[1],
-            'TLS' if self.ssl_connection else 'unsecured', self.server_address[0], self.server_address[1],
+        return '%s server at %s (%s) proxying %s (%s)' % (
+            self.proxy_type, Log.format_host_port(self.local_address),
+            'TLS' if self.ssl_connection else 'unsecured', Log.format_host_port(self.server_address),
             'STARTTLS' if self.custom_configuration['starttls'] else 'SSL/TLS')
 
     def handle_accept(self):
@@ -1927,8 +1940,7 @@ class OAuth2Proxy(asyncore.dispatcher):
         socket_family = socket.AF_INET6 if socket_family == socket.AF_UNSPEC else socket_family
         if socket_family != socket.AF_INET:
             try:
-                host, port = self.local_address
-                socket.getaddrinfo(host, port, socket_family, socket.SOCK_STREAM)
+                socket.getaddrinfo(self.local_address[0], self.local_address[1], socket_family, socket.SOCK_STREAM)
             except OSError:
                 socket_family = socket.AF_INET
         new_socket = socket.socket(socket_family, socket_type)
@@ -2373,9 +2385,9 @@ class App:
             if not heading_appended:
                 items.append(pystray.MenuItem('%s servers:' % server_type, None, enabled=False))
                 heading_appended = True
-            items.append(pystray.MenuItem('%s    %s:%d ➝ %s:%d' % (
+            items.append(pystray.MenuItem('%s    %s ➝ %s' % (
                 ('Y_SSL' if proxy.ssl_connection else 'N_SSL') if sys.platform == 'darwin' else '',
-                proxy.local_address[0], proxy.local_address[1], proxy.server_address[0], proxy.server_address[1]),
+                Log.format_host_port(proxy.local_address), Log.format_host_port(proxy.server_address)),
                                           None, enabled=False))
         if heading_appended:
             items.append(pystray.Menu.SEPARATOR)
@@ -2464,6 +2476,7 @@ class App:
         # noinspection PyDeprecation
         if pkg_resources.parse_version(
                 pkg_resources.get_distribution('pywebview').version) < pkg_resources.parse_version('3.6'):
+            # noinspection PyUnresolvedReferences
             authorisation_window.loaded += self.authorisation_window_loaded
         else:
             authorisation_window.events.loaded += self.authorisation_window_loaded
@@ -2505,6 +2518,7 @@ class App:
                 continue  # skip dummy window
 
             url = window.get_current_url()
+            # noinspection PyUnresolvedReferences
             username = window.get_title(window).split(' ')[-1]  # see note above: title *must* match this format
             if not url or not username:
                 continue  # skip any invalid windows
@@ -2587,7 +2601,7 @@ class App:
                     cmd_file.write(windows_start_command)
 
                 # on Windows we don't have a service to run, but it is still useful to exit the terminal instance
-                if sys.stdin.isatty() and not recreate_login_file:
+                if sys.stdin and sys.stdin.isatty() and not recreate_login_file:
                     self.exit(icon, restart_callback=lambda: subprocess.call(windows_start_command, shell=True))
             else:
                 os.remove(CMD_FILE_PATH)
@@ -2609,7 +2623,7 @@ class App:
                         desktop_file.write('%s=%s\n' % (key, value))
 
                 # like on Windows we don't have a service to run, but it is still useful to exit the terminal instance
-                if sys.stdin.isatty() and not recreate_login_file:
+                if sys.stdin and sys.stdin.isatty() and not recreate_login_file:
                     AppConfig.save()  # because linux_restart needs to unload to prevent saving on exit
                     self.linux_restart(icon)
             else:
@@ -2738,7 +2752,7 @@ class App:
             match = CONFIG_SERVER_MATCHER.match(section)
             server_type = match.group('type')
 
-            local_address = config.get(section, 'local_address', fallback='localhost')
+            local_address = config.get(section, 'local_address', fallback='::')
             str_local_port = match.group('port')
             local_port = -1
             try:
@@ -2869,6 +2883,10 @@ class App:
             data = REQUEST_QUEUE.get()  # note: blocking call
             if data is QUEUE_SENTINEL:  # app is closing
                 break
+            if data is MENU_UPDATE:
+                if icon:
+                    icon.update_menu()
+                break
             if not data['expired']:
                 Log.info('Authorisation request received for', data['username'],
                          '(local server auth mode)' if self.args.local_server_auth else '(external auth mode)' if
@@ -2879,7 +2897,7 @@ class App:
                     data['local_server_auth'] = True
                     RESPONSE_QUEUE.put(data)  # local server auth is handled by the client/server connections
                 elif self.args.external_auth and self.args.no_gui:
-                    if sys.stdin.isatty():
+                    if sys.stdin and sys.stdin.isatty():
                         self.notify(APP_NAME, 'No-GUI external auth mode: please authorise a request for account '
                                               '%s' % data['username'])
                         self.terminal_external_auth_prompt(data)
