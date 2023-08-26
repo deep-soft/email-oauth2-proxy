@@ -6,7 +6,7 @@
 __author__ = 'Simon Robinson'
 __copyright__ = 'Copyright (c) 2023 Simon Robinson'
 __license__ = 'Apache 2.0'
-__version__ = '2023-07-14'  # ISO 8601 (YYYY-MM-DD)
+__version__ = '2023-08-25'  # ISO 8601 (YYYY-MM-DD)
 
 import abc
 import argparse
@@ -68,8 +68,10 @@ no_gui_parser.add_argument('--no-gui', action='store_true')
 no_gui_parser.add_argument('--external-auth', action='store_true')
 no_gui_args = no_gui_parser.parse_known_args()[0]
 if not no_gui_args.no_gui:
-    # noinspection PyDeprecation
-    import pkg_resources  # from setuptools - to be changed to importlib.metadata and packaging.version once 3.8 is min.
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', DeprecationWarning)
+        # noinspection PyDeprecation
+        import pkg_resources  # from setuptools - to change to importlib.metadata and packaging.version once min. is 3.8
     import pystray  # the menu bar/taskbar GUI
     import timeago  # the last authenticated activity hint
     from PIL import Image, ImageDraw, ImageFont  # draw the menu bar icon from the TTF font stored in APP_ICON
@@ -1205,7 +1207,10 @@ class OAuth2ClientConnection(SSLAsyncoreDispatcher):
     def handle_close(self):
         error_type, value = Log.get_last_error()
         if error_type and value:
-            Log.info(self.info_string(), 'Caught connection error (client) -', error_type.__name__, ':', value)
+            message = 'Caught connection error (client)'
+            if error_type == ConnectionResetError:
+                message = '%s [ Are you attempting an encrypted connection to a non-encrypted server? ]' % message
+            Log.info(self.info_string(), message, '-', error_type.__name__, ':', value)
         self.close()
 
     def close(self):
@@ -1610,9 +1615,10 @@ class OAuth2ServerConnection(SSLAsyncoreDispatcher):
         error_type, value = Log.get_last_error()
         if error_type == TimeoutError and value.errno == errno.ETIMEDOUT or \
                 issubclass(error_type, ConnectionError) and value.errno in [errno.ECONNRESET, errno.ECONNREFUSED] or \
-                error_type == OSError and value.errno in [0, errno.ENETDOWN, errno.EHOSTUNREACH]:
+                error_type == OSError and value.errno in [0, errno.ENETDOWN, errno.EHOSTDOWN, errno.EHOSTUNREACH]:
             # TimeoutError 60 = 'Operation timed out'; ConnectionError 54 = 'Connection reset by peer', 61 = 'Connection
-            # refused;  OSError 0 = 'Error' (typically network failure), 50 = 'Network is down', 65 = 'No route to host'
+            # refused;  OSError 0 = 'Error' (typically network failure), 50 = 'Network is down', 64 = 'Host is down';
+            # 65 = 'No route to host'
             Log.info(self.info_string(), 'Caught network error (server) - is there a network connection?',
                      'Error type', error_type, 'with message:', value)
             self.close()
@@ -1951,8 +1957,11 @@ class OAuth2Proxy(asyncore.dispatcher):
         if self.ssl_connection:
             # noinspection PyTypeChecker
             ssl_context = ssl.create_default_context(purpose=ssl.Purpose.CLIENT_AUTH)
-            ssl_context.load_cert_chain(certfile=self.custom_configuration['local_certificate_path'],
-                                        keyfile=self.custom_configuration['local_key_path'])
+            try:
+                ssl_context.load_cert_chain(certfile=self.custom_configuration['local_certificate_path'],
+                                            keyfile=self.custom_configuration['local_key_path'])
+            except FileNotFoundError as e:
+                raise FileNotFoundError('Unable to open `local_certificate_path` and/or `local_key_path`') from e
 
             # suppress_ragged_eofs=True: see test_ssl.py documentation in https://github.com/python/cpython/pull/5266
             self.set_socket(ssl_context.wrap_socket(new_socket, server_side=True, suppress_ragged_eofs=True,
@@ -2282,6 +2291,7 @@ class App:
             self.exit(self.icon)
 
     def create_icon(self):
+        Image.ANTIALIAS = Image.LANCZOS  # temporary fix for pystray incompatibility with PIL >= 10.0.0
         icon_class = RetinaIcon if sys.platform == 'darwin' else pystray.Icon
         return icon_class(APP_NAME, App.get_image(), APP_NAME, menu=pystray.Menu(
             pystray.MenuItem('Servers and accounts', pystray.Menu(self.create_config_menu)),
@@ -2886,7 +2896,7 @@ class App:
             if data is MENU_UPDATE:
                 if icon:
                     icon.update_menu()
-                break
+                continue
             if not data['expired']:
                 Log.info('Authorisation request received for', data['username'],
                          '(local server auth mode)' if self.args.local_server_auth else '(external auth mode)' if
