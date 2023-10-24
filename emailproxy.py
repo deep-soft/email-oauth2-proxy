@@ -6,7 +6,7 @@
 __author__ = 'Simon Robinson'
 __copyright__ = 'Copyright (c) 2023 Simon Robinson'
 __license__ = 'Apache 2.0'
-__version__ = '2023-08-25'  # ISO 8601 (YYYY-MM-DD)
+__version__ = '2023-10-22'  # ISO 8601 (YYYY-MM-DD)
 
 import abc
 import argparse
@@ -50,7 +50,7 @@ with warnings.catch_warnings():
     import asyncore
 
 # for encrypting/decrypting the locally-stored credentials
-from cryptography.fernet import Fernet, InvalidToken
+from cryptography.fernet import Fernet, MultiFernet, InvalidToken
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
@@ -123,6 +123,7 @@ APP_ICON = b'''eNp1Uc9rE0EUfjM7u1nyq0m72aQxpnbTbFq0TbJNNkGkNpVKb2mxtgjWsqRJU+jaQ
     J6Sp0urC5fCken5STr0KDoUlyhjVd4nxSUvq3tCftEn8r2ro+mxUDIaCMQmQrGZGHmi53tAT3rPGH1e3qF0p9w7LtcohwuyvnRxWZ8sZUej6WvlhXSk1
     7k+POJ1iR73N/+w2xN0f4+GJcHtfqoWzgfi6cuZscC54lSq3SbN1tmzC4MXtcwN/zOC78r9BIfNc3M='''  # TTF ('e') -> zlib -> base64
 
+CENSOR_CREDENTIALS = True
 CENSOR_MESSAGE = b'[[ Credentials removed from proxy log ]]'  # replaces actual credentials; must be a byte-type string
 
 script_path = sys.executable if getattr(sys, 'frozen', False) else os.path.realpath(__file__)  # for pyinstaller etc
@@ -405,57 +406,89 @@ class AWSSecretsManagerCacheStore(CacheStore):
             Log.error('Unable to get AWS SDK client; cannot cache credentials to AWS Secrets Manager')
 
 
+class ConcurrentConfigParser:
+    """Helper wrapper to add locking to a ConfigParser object (note: only wraps the methods used in this script)"""
+
+    def __init__(self):
+        self.config = configparser.ConfigParser()
+        self.lock = threading.Lock()
+
+    def read(self, filename):
+        with self.lock:
+            self.config.read(filename)
+
+    def sections(self):
+        with self.lock:
+            return self.config.sections()
+
+    def add_section(self, section):
+        with self.lock:
+            self.config.add_section(section)
+
+    def get(self, section, option, fallback=None):
+        with self.lock:
+            return self.config.get(section, option, fallback=fallback)
+
+    def getint(self, section, option, fallback=None):
+        with self.lock:
+            return self.config.getint(section, option, fallback=fallback)
+
+    def getboolean(self, section, option, fallback=None):
+        with self.lock:
+            return self.config.getboolean(section, option, fallback=fallback)
+
+    def set(self, section, option, value):
+        with self.lock:
+            self.config.set(section, option, value)
+
+    def remove_option(self, section, option):
+        with self.lock:
+            self.config.remove_option(section, option)
+
+    def write(self, file):
+        with self.lock:
+            self.config.write(file)
+
+    def items(self):
+        with self.lock:
+            return self.config.items()  # used in read_dict when saving to cache store
+
+
 class AppConfig:
     """Helper wrapper around ConfigParser to cache servers/accounts, and avoid writing to the file until necessary"""
 
     _PARSER = None
-    _LOADED = False
-
-    _GLOBALS = None
-    _SERVERS = []
-    _ACCOUNTS = []
+    _PARSER_LOCK = threading.Lock()
 
     # note: removing the unencrypted version of `client_secret_encrypted` is not automatic with --cache-store (see docs)
-    _CACHED_OPTION_KEYS = ['token_salt', 'access_token', 'access_token_expiry', 'refresh_token', 'last_activity',
-                           'client_secret_encrypted']
+    _CACHED_OPTION_KEYS = ['access_token', 'access_token_expiry', 'refresh_token', 'token_salt', 'token_iterations',
+                           'client_secret_encrypted', 'last_activity']
 
     # additional cache stores may be implemented by extending CacheStore and adding a prefix entry in this dict
     _EXTERNAL_CACHE_STORES = {'aws:': AWSSecretsManagerCacheStore}
 
     @staticmethod
     def _load():
-        AppConfig.unload()
-        AppConfig._PARSER = configparser.ConfigParser()
-        AppConfig._PARSER.read(CONFIG_FILE_PATH)
-
-        config_sections = AppConfig._PARSER.sections()
-        if APP_SHORT_NAME in config_sections:
-            AppConfig._GLOBALS = AppConfig._PARSER[APP_SHORT_NAME]
-        else:
-            AppConfig._GLOBALS = configparser.SectionProxy(AppConfig._PARSER, APP_SHORT_NAME)
+        config_parser = ConcurrentConfigParser()
+        config_parser.read(CONFIG_FILE_PATH)
 
         # cached account credentials can be stored in the configuration file (default) or, via `--cache-store`, a
         # separate local file or external service (such as a secrets manager) - we combine these sources at load time
         if CACHE_STORE != CONFIG_FILE_PATH:
             # it would be cleaner to avoid specific options here, but best to load unexpected sections only when enabled
-            allow_catch_all_accounts = AppConfig._GLOBALS.getboolean('allow_catch_all_accounts', fallback=False)
+            allow_catch_all_accounts = config_parser.getboolean(APP_SHORT_NAME, 'allow_catch_all_accounts',
+                                                                fallback=False)
 
             cache_file_parser = AppConfig._load_cache(CACHE_STORE)
             cache_file_accounts = [s for s in cache_file_parser.sections() if '@' in s]
             for account in cache_file_accounts:
-                if allow_catch_all_accounts and account not in AppConfig._PARSER.sections():  # missing sub-accounts
-                    AppConfig._PARSER.add_section(account)
+                if allow_catch_all_accounts and account not in config_parser.sections():  # missing sub-accounts
+                    config_parser.add_section(account)
                 for option in cache_file_parser.options(account):
                     if option in AppConfig._CACHED_OPTION_KEYS:
-                        AppConfig._PARSER.set(account, option, cache_file_parser.get(account, option))
+                        config_parser.set(account, option, cache_file_parser.get(account, option))
 
-            if allow_catch_all_accounts:
-                config_sections = AppConfig._PARSER.sections()  # new sections may have been added
-
-        AppConfig._SERVERS = [s for s in config_sections if CONFIG_SERVER_MATCHER.match(s)]
-        AppConfig._ACCOUNTS = [s for s in config_sections if '@' in s]
-
-        AppConfig._LOADED = True
+        return config_parser
 
     @staticmethod
     def _load_cache(cache_store_identifier):
@@ -469,59 +502,47 @@ class AppConfig:
 
     @staticmethod
     def get():
-        if not AppConfig._LOADED:
-            AppConfig._load()
-        return AppConfig._PARSER
+        with AppConfig._PARSER_LOCK:
+            if AppConfig._PARSER is None:
+                AppConfig._PARSER = AppConfig._load()
+            return AppConfig._PARSER
 
     @staticmethod
     def unload():
-        AppConfig._PARSER = None
-        AppConfig._LOADED = False
-
-        AppConfig._GLOBALS = None
-        AppConfig._SERVERS = []
-        AppConfig._ACCOUNTS = []
+        with AppConfig._PARSER_LOCK:
+            AppConfig._PARSER = None
 
     @staticmethod
-    def reload():
-        AppConfig.unload()
-        return AppConfig.get()
-
-    @staticmethod
-    def globals():
-        AppConfig.get()  # make sure config is loaded
-        return AppConfig._GLOBALS
+    def get_global(name, fallback):
+        return AppConfig.get().getboolean(APP_SHORT_NAME, name, fallback)
 
     @staticmethod
     def servers():
-        AppConfig.get()  # make sure config is loaded
-        return AppConfig._SERVERS
+        return [s for s in AppConfig.get().sections() if CONFIG_SERVER_MATCHER.match(s)]
 
     @staticmethod
     def accounts():
-        AppConfig.get()  # make sure config is loaded
-        return AppConfig._ACCOUNTS
-
-    @staticmethod
-    def add_account(username):
-        AppConfig._PARSER.add_section(username)
-        AppConfig._ACCOUNTS = [s for s in AppConfig._PARSER.sections() if '@' in s]
+        return [s for s in AppConfig.get().sections() if '@' in s]
 
     @staticmethod
     def save():
-        if AppConfig._LOADED:
+        with AppConfig._PARSER_LOCK:
+            if AppConfig._PARSER is None:  # intentionally using _PARSER not get() so we don't (re-)load if unloaded
+                return
+
             if CACHE_STORE != CONFIG_FILE_PATH:
                 # in `--cache-store` mode we ignore everything except _CACHED_OPTION_KEYS (OAuth 2.0 tokens, etc)
                 output_config_parser = configparser.ConfigParser()
                 output_config_parser.read_dict(AppConfig._PARSER)  # a deep copy of the current configuration
+                config_accounts = [s for s in output_config_parser.sections() if '@' in s]
 
-                for account in AppConfig._ACCOUNTS:
+                for account in config_accounts:
                     for option in output_config_parser.options(account):
                         if option not in AppConfig._CACHED_OPTION_KEYS:
                             output_config_parser.remove_option(account, option)
 
                 for section in output_config_parser.sections():
-                    if section not in AppConfig._ACCOUNTS or len(output_config_parser.options(section)) <= 0:
+                    if section not in config_accounts or len(output_config_parser.options(section)) <= 0:
                         output_config_parser.remove_section(section)
 
                 AppConfig._save_cache(CACHE_STORE, output_config_parser)
@@ -549,18 +570,85 @@ class AppConfig:
             Log.error('Error saving state to cache store file at', cache_store_identifier, '- is the file writable?')
 
 
+class Cryptographer:
+    ITERATIONS = 870_000  # taken from cryptography's suggestion of using Django's defaults
+    LEGACY_ITERATIONS = 100_000  # fallback when the iteration count is not in the config file (versions < 2023-10-17)
+
+    def __init__(self, config, username, password):
+        """Creates a cryptographer which allows encrypting and decrypting sensitive information for this account,
+        (such as stored tokens), and also supports increasing the encryption/decryption iterations (i.e., strength)"""
+        self._salt = None
+
+        token_salt = config.get(username, 'token_salt', fallback=None)
+        if token_salt:
+            try:
+                self._salt = base64.b64decode(token_salt.encode('utf-8'))  # catch incorrect third-party proxy guide
+            except (binascii.Error, UnicodeError):
+                Log.info('%s: Invalid `token_salt` value found in config file entry for account %s - this value is not '
+                         'intended to be manually created; generating new `token_salt`' % (APP_NAME, username))
+
+        if not self._salt:
+            self._salt = os.urandom(16)  # either a failed decode or the initial run when no salt exists
+
+        # the iteration count is stored with the credentials, so could if required be user-edited (see PR #198 comments)
+        iterations = config.getint(username, 'token_iterations', fallback=self.LEGACY_ITERATIONS)
+
+        # with MultiFernet each fernet is tried in order to decrypt a value, but encryption always uses the first
+        # fernet, so sort unique iteration counts in descending order (i.e., use the best available encryption)
+        self._iterations_options = sorted({self.ITERATIONS, iterations, self.LEGACY_ITERATIONS}, reverse=True)
+
+        # generate encrypter/decrypter based on the password and salt
+        self._fernets = [Fernet(base64.urlsafe_b64encode(
+            PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=self._salt, iterations=iterations,
+                       backend=default_backend()).derive(password.encode('utf-8')))) for iterations in
+            self._iterations_options]
+        self.fernet = MultiFernet(self._fernets)
+
+    @property
+    def salt(self):
+        return base64.b64encode(self._salt).decode('utf-8')
+
+    @property
+    def iterations(self):
+        return self._iterations_options[0]
+
+    def encrypt(self, value):
+        return self.fernet.encrypt(value.encode('utf-8')).decode('utf-8')
+
+    def decrypt(self, value):
+        return self.fernet.decrypt(value.encode('utf-8')).decode('utf-8')
+
+    def requires_rotation(self, value):
+        try:
+            self._fernets[0].decrypt(value.encode('utf-8'))  # if the first fernet works, everything is up-to-date
+            return False
+        except InvalidToken:
+            try:  # check to see if any fernet can decrypt the value - if so we can upgrade the encryption strength
+                self.decrypt(value)
+                return True
+            except InvalidToken:
+                return False
+
+    def rotate(self, value):
+        return self.fernet.rotate(value.encode('utf-8')).decode('utf-8')
+
+
 class OAuth2Helper:
+    class TokenRefreshError(Exception):
+        pass
+
     @staticmethod
-    def get_oauth2_credentials(username, password, recurse_retries=True):
+    def get_oauth2_credentials(username, password, reload_remote_accounts=True):
         """Using the given username (i.e., email address) and password, reads account details from AppConfig and
         handles OAuth 2.0 token request and renewal, saving the updated details back to AppConfig (or removing them
         if invalid). Returns either (True, '[OAuth2 string for authentication]') or (False, '[Error message]')"""
 
         # we support broader catch-all account names (e.g., `@domain.com` / `@`) if enabled
-        valid_accounts = [username in AppConfig.accounts()]
-        if AppConfig.globals().getboolean('allow_catch_all_accounts', fallback=False):
+        config_accounts = AppConfig.accounts()
+        valid_accounts = [username in config_accounts]
+        if AppConfig.get_global('allow_catch_all_accounts', fallback=False):
             user_domain = '@%s' % username.split('@')[-1]
-            valid_accounts.extend([account in AppConfig.accounts() for account in [user_domain, '@']])
+            valid_accounts.extend([account in config_accounts for account in [user_domain, '@']])
 
         if not any(valid_accounts):
             Log.error('Proxy config file entry missing for account', username, '- aborting login')
@@ -572,7 +660,7 @@ class OAuth2Helper:
 
         def get_account_with_catch_all_fallback(option):
             fallback = None
-            if AppConfig.globals().getboolean('allow_catch_all_accounts', fallback=False):
+            if AppConfig.get_global('allow_catch_all_accounts', fallback=False):
                 fallback = config.get(user_domain, option, fallback=config.get('@', option, fallback=None))
             return config.get(username, option, fallback=fallback)
 
@@ -607,47 +695,46 @@ class OAuth2Helper:
                          'otherwise, if authentication fails, please double-check this value is correct')
 
         current_time = int(time.time())
-        token_salt = config.get(username, 'token_salt', fallback=None)
         access_token = config.get(username, 'access_token', fallback=None)
         access_token_expiry = config.getint(username, 'access_token_expiry', fallback=current_time)
         refresh_token = config.get(username, 'refresh_token', fallback=None)
 
         # try reloading remotely cached tokens if possible
-        if not access_token and CACHE_STORE != CONFIG_FILE_PATH and recurse_retries:
-            AppConfig.reload()
-            return OAuth2Helper.get_oauth2_credentials(username, password, recurse_retries=False)
+        if not access_token and CACHE_STORE != CONFIG_FILE_PATH and reload_remote_accounts:
+            AppConfig.unload()
+            return OAuth2Helper.get_oauth2_credentials(username, password, reload_remote_accounts=False)
 
-        # we hash locally-stored tokens with the given password
-        if not token_salt:
-            token_salt = base64.b64encode(os.urandom(16)).decode('utf-8')
+        cryptographer = Cryptographer(config, username, password)
+        rotatable_values = {
+            'access_token': access_token,
+            'refresh_token': refresh_token,
+            'client_secret_encrypted': client_secret_encrypted
+        }
+        if any(value and cryptographer.requires_rotation(value) for value in rotatable_values.values()):
+            Log.info('Rotating stored secrets for account', username, 'to use new cryptographic parameters')
+            for key, value in rotatable_values.items():
+                if value:
+                    config.set(username, key, cryptographer.rotate(value))
 
-        # generate encrypter/decrypter based on password and random salt
-        try:
-            decoded_salt = base64.b64decode(token_salt.encode('utf-8'))  # catch incorrect third-party proxy guide
-        except binascii.Error:
-            return (False, '%s: Invalid `token_salt` value found in config file entry for account %s - this value is '
-                           'not intended to be manually created; please remove and retry' % (APP_NAME, username))
-        key_derivation_function = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=decoded_salt, iterations=100000,
-                                             backend=default_backend())
-        fernet = Fernet(base64.urlsafe_b64encode(key_derivation_function.derive(password.encode('utf-8'))))
+            config.set(username, 'token_iterations', str(cryptographer.iterations))
+            AppConfig.save()
 
         try:
             # if both secret values are present we use the unencrypted version (as it may have been user-edited)
             if client_secret_encrypted and not client_secret:
-                client_secret = OAuth2Helper.decrypt(fernet, client_secret_encrypted)
+                client_secret = cryptographer.decrypt(client_secret_encrypted)
 
-            if access_token:
-                if access_token_expiry - current_time < TOKEN_EXPIRY_MARGIN:  # refresh if expiring soon (if possible)
+            if access_token or refresh_token:  # if possible, refresh the existing token(s)
+                if not access_token or access_token_expiry - current_time < TOKEN_EXPIRY_MARGIN:
                     if refresh_token:
                         response = OAuth2Helper.refresh_oauth2_access_token(token_url, client_id, client_secret,
-                                                                            OAuth2Helper.decrypt(fernet, refresh_token))
+                                                                            cryptographer.decrypt(refresh_token))
 
                         access_token = response['access_token']
-                        config.set(username, 'access_token', OAuth2Helper.encrypt(fernet, access_token))
+                        config.set(username, 'access_token', cryptographer.encrypt(access_token))
                         config.set(username, 'access_token_expiry', str(current_time + response['expires_in']))
                         if 'refresh_token' in response:
-                            config.set(username, 'refresh_token',
-                                       OAuth2Helper.encrypt(fernet, response['refresh_token']))
+                            config.set(username, 'refresh_token', cryptographer.encrypt(response['refresh_token']))
                         AppConfig.save()
 
                     else:
@@ -658,7 +745,7 @@ class OAuth2Helper:
                         # very infrequently, we don't add the extra complexity for just 10 extra minutes of token life)
                         access_token = None  # avoid trying invalid (or soon to be) tokens
                 else:
-                    access_token = OAuth2Helper.decrypt(fernet, access_token)
+                    access_token = cryptographer.decrypt(access_token)
 
             if not access_token:
                 auth_result = None
@@ -682,24 +769,25 @@ class OAuth2Helper:
                                                                         oauth2_flow, username, password)
 
                 access_token = response['access_token']
-                if not config.has_section(username):
-                    AppConfig.add_account(username)  # in wildcard mode the section may not yet exist
+                if username not in config.sections():
+                    config.add_section(username)  # in catch-all mode the section may not yet exist
                     REQUEST_QUEUE.put(MENU_UPDATE)  # make sure the menu shows the newly-added account
-                config.set(username, 'token_salt', token_salt)
-                config.set(username, 'access_token', OAuth2Helper.encrypt(fernet, access_token))
+                config.set(username, 'token_salt', cryptographer.salt)
+                config.set(username, 'token_iterations', str(cryptographer.iterations))
+                config.set(username, 'access_token', cryptographer.encrypt(access_token))
                 config.set(username, 'access_token_expiry', str(current_time + response['expires_in']))
 
                 if 'refresh_token' in response:
-                    config.set(username, 'refresh_token', OAuth2Helper.encrypt(fernet, response['refresh_token']))
+                    config.set(username, 'refresh_token', cryptographer.encrypt(response['refresh_token']))
                 elif permission_url:  # ignore this situation with client credentials flow - it is expected
                     Log.info('Warning: no refresh token returned for', username, '- you will need to re-authenticate',
                              'each time the access token expires (does your `oauth2_scope` value allow `offline` use?)')
 
-                if AppConfig.globals().getboolean('encrypt_client_secret_on_first_use', fallback=False):
+                if AppConfig.get_global('encrypt_client_secret_on_first_use', fallback=False):
                     if client_secret:
                         # note: save to the `username` entry even if `user_domain` exists, avoiding conflicts when using
                         # incompatible `encrypt_client_secret_on_first_use` and `allow_catch_all_accounts` options
-                        config.set(username, 'client_secret_encrypted', OAuth2Helper.encrypt(fernet, client_secret))
+                        config.set(username, 'client_secret_encrypted', cryptographer.encrypt(client_secret))
                         config.remove_option(username, 'client_secret')
 
                 AppConfig.save()
@@ -709,23 +797,36 @@ class OAuth2Helper:
             oauth2_string = OAuth2Helper.construct_oauth2_string(username, access_token)
             return True, oauth2_string
 
-        except InvalidToken as e:
-            # if invalid details are the reason for failure we remove our cached version and re-authenticate - this can
-            # be disabled by a configuration setting, but note that we always remove credentials on 400 Bad Request
-            if e.args == (400, APP_PACKAGE) or AppConfig.globals().getboolean('delete_account_token_on_password_error',
-                                                                              fallback=True):
+        except OAuth2Helper.TokenRefreshError as e:
+            # always clear access tokens - can easily request another via the refresh token (with no user interaction)
+            has_access_token = True if config.get(username, 'access_token', fallback=None) else False
+            config.remove_option(username, 'access_token')
+            config.remove_option(username, 'access_token_expiry')
+
+            if not has_access_token:
+                # if this is already a second failure, remove the refresh token as well, and force re-authentication
                 config.remove_option(username, 'token_salt')
+                config.remove_option(username, 'token_iterations')
+                config.remove_option(username, 'refresh_token')
+
+            AppConfig.save()
+
+            Log.info('Retrying login due to exception while refreshing OAuth 2.0 tokens for', username,
+                     '(attempt %d):' % (1 if has_access_token else 2), Log.error_string(e))
+            return OAuth2Helper.get_oauth2_credentials(username, password, reload_remote_accounts=False)
+
+        except InvalidToken as e:
+            if AppConfig.get_global('delete_account_token_on_password_error', fallback=True):
                 config.remove_option(username, 'access_token')
                 config.remove_option(username, 'access_token_expiry')
+                config.remove_option(username, 'token_salt')
+                config.remove_option(username, 'token_iterations')
                 config.remove_option(username, 'refresh_token')
                 AppConfig.save()
-            else:
-                recurse_retries = False  # no need to recurse if we are just trying the same credentials again
 
-            if recurse_retries:
-                Log.info('Retrying login due to exception while requesting OAuth 2.0 credentials for %s:' % username,
-                         Log.error_string(e))
-                return OAuth2Helper.get_oauth2_credentials(username, password, recurse_retries=False)
+                Log.info('Retrying login due to exception while decrypting OAuth 2.0 credentials for', username,
+                         '(invalid password):', Log.error_string(e))
+                return OAuth2Helper.get_oauth2_credentials(username, password, reload_remote_accounts=False)
 
             Log.error('Invalid password to decrypt', username, 'credentials - aborting login:', Log.error_string(e))
             return False, '%s: Login failed - the password for account %s is incorrect' % (APP_NAME, username)
@@ -739,14 +840,6 @@ class OAuth2Helper:
             Log.info('Caught exception while requesting OAuth 2.0 credentials for %s:' % username, Log.error_string(e))
             return False, '%s: Login failed for account %s - please check your internet connection and retry' % (
                 APP_NAME, username)
-
-    @staticmethod
-    def encrypt(cryptographer, byte_input):
-        return cryptographer.encrypt(byte_input.encode('utf-8')).decode('utf-8')
-
-    @staticmethod
-    def decrypt(cryptographer, byte_input):
-        return cryptographer.decrypt(byte_input.encode('utf-8')).decode('utf-8')
 
     @staticmethod
     def oauth2_url_escape(text):
@@ -932,8 +1025,8 @@ class OAuth2Helper:
         except urllib.error.HTTPError as e:
             e.message = json.loads(e.read())
             Log.debug('Error refreshing access token - received invalid response:', e.message)
-            if e.code == 400:  # 400 Bad Request typically means re-authentication is required (refresh token expired)
-                raise InvalidToken(e.code, APP_PACKAGE) from e
+            if e.code == 400:  # 400 Bad Request typically means re-authentication is required (token expired)
+                raise OAuth2Helper.TokenRefreshError from e
             raise e
 
     @staticmethod
@@ -983,8 +1076,8 @@ class OAuth2Helper:
 
 
 class SSLAsyncoreDispatcher(asyncore.dispatcher_with_send):
-    def __init__(self, connection=None, socket_map=None):
-        asyncore.dispatcher_with_send.__init__(self, sock=connection, map=socket_map)
+    def __init__(self, connection_socket=None, socket_map=None):
+        asyncore.dispatcher_with_send.__init__(self, sock=connection_socket, map=socket_map)
         self.ssl_handshake_errors = (ssl.SSLWantReadError, ssl.SSLWantWriteError,
                                      ssl.SSLEOFError, ssl.SSLZeroReturnError)
         self.ssl_connection, self.ssl_handshake_attempts, self.ssl_handshake_completed = self._reset()
@@ -1109,17 +1202,17 @@ class OAuth2ClientConnection(SSLAsyncoreDispatcher):
     """The base client-side connection that is subclassed to handle IMAP/POP/SMTP client interaction (note that there
     is some protocol-specific code in here, but it is not essential, and only used to avoid logging credentials)"""
 
-    def __init__(self, proxy_type, connection, socket_map, connection_info, server_connection, proxy_parent,
-                 custom_configuration):
-        SSLAsyncoreDispatcher.__init__(self, connection, socket_map)
+    def __init__(self, proxy_type, connection_socket, socket_map, proxy_parent, custom_configuration):
+        SSLAsyncoreDispatcher.__init__(self, connection_socket=connection_socket, socket_map=socket_map)
         self.receive_buffer = b''
         self.proxy_type = proxy_type
-        self.connection_info = connection_info
-        self.server_connection = server_connection
-        self.local_address = proxy_parent.local_address
-        self.server_address = server_connection.server_address
+        self.server_connection = None
         self.proxy_parent = proxy_parent
+        self.local_address = proxy_parent.local_address
+        self.server_address = proxy_parent.server_address
         self.custom_configuration = custom_configuration
+        self.debug_address_string = '%s-{%s}-%s' % tuple(map(Log.format_host_port, (
+            connection_socket.getpeername(), connection_socket.getsockname(), self.server_address)))
 
         self.censor_next_log = False  # try to avoid logging credentials
         self.authenticated = False
@@ -1128,11 +1221,11 @@ class OAuth2ClientConnection(SSLAsyncoreDispatcher):
             bool(custom_configuration['local_certificate_path'] and custom_configuration['local_key_path']))
 
     def info_string(self):
-        debug_string = '; %s->%s' % (Log.format_host_port(self.connection_info), Log.format_host_port(
-            self.server_address)) if Log.get_level() == logging.DEBUG else ''
+        debug_string = self.debug_address_string if Log.get_level() == logging.DEBUG else \
+            Log.format_host_port(self.local_address)
         account = '; %s' % self.server_connection.authenticated_username if \
             self.server_connection and self.server_connection.authenticated_username else ''
-        return '%s (%s%s%s)' % (self.proxy_type, Log.format_host_port(self.local_address), debug_string, account)
+        return '%s (%s%s)' % (self.proxy_type, debug_string, account)
 
     def handle_read(self):
         byte_data = self.recv(RECEIVE_BUFFER_SIZE)
@@ -1179,7 +1272,7 @@ class OAuth2ClientConnection(SSLAsyncoreDispatcher):
                     log_data = re.sub(b'(%s)?( )?(AUTH)(ENTICATE)? (PLAIN|LOGIN) (.*)\r\n' % tag_pattern,
                                       br'\1\2\3\4 \5 ' + CENSOR_MESSAGE + b'\r\n', log_data, flags=re.IGNORECASE)
 
-                Log.debug(self.info_string(), '-->', log_data)
+                Log.debug(self.info_string(), '-->', log_data if CENSOR_CREDENTIALS else line)
                 try:
                     self.process_data(line)
                 except AttributeError:  # AttributeError("'NoneType' object has no attribute 'username'"), etc
@@ -1228,9 +1321,8 @@ class OAuth2ClientConnection(SSLAsyncoreDispatcher):
 class IMAPOAuth2ClientConnection(OAuth2ClientConnection):
     """The client side of the connection - intercept LOGIN/AUTHENTICATE commands and replace with OAuth 2.0 SASL"""
 
-    def __init__(self, connection, socket_map, connection_info, server_connection, proxy_parent, custom_configuration):
-        super().__init__('IMAP', connection, socket_map, connection_info, server_connection, proxy_parent,
-                         custom_configuration)
+    def __init__(self, connection_socket, socket_map, proxy_parent, custom_configuration):
+        super().__init__('IMAP', connection_socket, socket_map, proxy_parent, custom_configuration)
         self.authentication_tag = None
         self.authentication_command = None
         self.awaiting_credentials = False
@@ -1358,9 +1450,8 @@ class POPOAuth2ClientConnection(OAuth2ClientConnection):
         XOAUTH2_AWAITING_CONFIRMATION = 5
         XOAUTH2_CREDENTIALS_SENT = 6
 
-    def __init__(self, connection, socket_map, connection_info, server_connection, proxy_parent, custom_configuration):
-        super().__init__('POP', connection, socket_map, connection_info, server_connection, proxy_parent,
-                         custom_configuration)
+    def __init__(self, connection_socket, socket_map, proxy_parent, custom_configuration):
+        super().__init__('POP', connection_socket, socket_map, proxy_parent, custom_configuration)
         self.connection_state = self.STATE.PENDING
 
     def process_data(self, byte_data, censor_server_log=False):
@@ -1437,9 +1528,8 @@ class SMTPOAuth2ClientConnection(OAuth2ClientConnection):
         XOAUTH2_AWAITING_CONFIRMATION = 6
         XOAUTH2_CREDENTIALS_SENT = 7
 
-    def __init__(self, connection, socket_map, connection_info, server_connection, proxy_parent, custom_configuration):
-        super().__init__('SMTP', connection, socket_map, connection_info, server_connection, proxy_parent,
-                         custom_configuration)
+    def __init__(self, connection_socket, socket_map, proxy_parent, custom_configuration):
+        super().__init__('SMTP', connection_socket, socket_map, proxy_parent, custom_configuration)
         self.connection_state = self.STATE.PENDING
 
     def process_data(self, byte_data, censor_server_log=False):
@@ -1514,16 +1604,17 @@ class SMTPOAuth2ClientConnection(OAuth2ClientConnection):
 class OAuth2ServerConnection(SSLAsyncoreDispatcher):
     """The base server-side connection that is subclassed to handle IMAP/POP/SMTP server interaction"""
 
-    def __init__(self, proxy_type, socket_map, server_address, connection_info, proxy_parent, custom_configuration):
+    def __init__(self, proxy_type, connection_socket, socket_map, proxy_parent, custom_configuration):
         SSLAsyncoreDispatcher.__init__(self, socket_map=socket_map)  # note: establish connection later due to STARTTLS
         self.receive_buffer = b''
         self.proxy_type = proxy_type
-        self.connection_info = connection_info
         self.client_connection = None
-        self.local_address = proxy_parent.local_address
-        self.server_address = server_address
         self.proxy_parent = proxy_parent
+        self.local_address = proxy_parent.local_address
+        self.server_address = proxy_parent.server_address
         self.custom_configuration = custom_configuration
+        self.debug_address_string = '%s-{%s}-%s' % tuple(map(Log.format_host_port, (
+            connection_socket.getpeername(), connection_socket.getsockname(), self.server_address)))
 
         self.authenticated_username = None  # used only for showing last activity in the menu
         self.last_activity = 0
@@ -1538,10 +1629,10 @@ class OAuth2ServerConnection(SSLAsyncoreDispatcher):
             return
 
     def info_string(self):
-        debug_string = '; %s->%s' % (Log.format_host_port(self.connection_info), Log.format_host_port(
-            self.server_address)) if Log.get_level() == logging.DEBUG else ''
+        debug_string = self.debug_address_string if Log.get_level() == logging.DEBUG else \
+            Log.format_host_port(self.local_address)
         account = '; %s' % self.authenticated_username if self.authenticated_username else ''
-        return '%s (%s%s%s)' % (self.proxy_type, Log.format_host_port(self.local_address), debug_string, account)
+        return '%s (%s%s)' % (self.proxy_type, debug_string, account)
 
     def handle_connect(self):
         Log.debug(self.info_string(), '--> [ Client connected ]')
@@ -1608,7 +1699,8 @@ class OAuth2ServerConnection(SSLAsyncoreDispatcher):
 
     def send(self, byte_data, censor_log=False):
         if not self.client_connection.authenticated:  # after authentication these are identical to server-side logs
-            Log.debug(self.info_string(), '    -->', b'%s\r\n' % CENSOR_MESSAGE if censor_log else byte_data)
+            Log.debug(self.info_string(), '    -->',
+                      b'%s\r\n' % CENSOR_MESSAGE if CENSOR_CREDENTIALS and censor_log else byte_data)
         return super().send(byte_data)
 
     def handle_error(self):
@@ -1656,8 +1748,8 @@ class IMAPOAuth2ServerConnection(OAuth2ServerConnection):
 
     # IMAP: https://tools.ietf.org/html/rfc3501
     # IMAP SASL-IR: https://tools.ietf.org/html/rfc4959
-    def __init__(self, socket_map, server_address, connection_info, proxy_parent, custom_configuration):
-        super().__init__('IMAP', socket_map, server_address, connection_info, proxy_parent, custom_configuration)
+    def __init__(self, connection_socket, socket_map, proxy_parent, custom_configuration):
+        super().__init__('IMAP', connection_socket, socket_map, proxy_parent, custom_configuration)
 
     def process_data(self, byte_data):
         # note: there is no reason why IMAP STARTTLS (https://tools.ietf.org/html/rfc2595) couldn't be supported here
@@ -1698,8 +1790,8 @@ class POPOAuth2ServerConnection(OAuth2ServerConnection):
     # POP3 CAPA: https://tools.ietf.org/html/rfc2449
     # POP3 AUTH: https://tools.ietf.org/html/rfc1734
     # POP3 SASL: https://tools.ietf.org/html/rfc5034
-    def __init__(self, socket_map, server_address, connection_info, proxy_parent, custom_configuration):
-        super().__init__('POP', socket_map, server_address, connection_info, proxy_parent, custom_configuration)
+    def __init__(self, connection_socket, socket_map, proxy_parent, custom_configuration):
+        super().__init__('POP', connection_socket, socket_map, proxy_parent, custom_configuration)
         self.capa = []
         self.username = None
         self.password = None
@@ -1783,8 +1875,8 @@ class SMTPOAuth2ServerConnection(OAuth2ServerConnection):
         NEGOTIATING = 2
         COMPLETE = 3
 
-    def __init__(self, socket_map, server_address, connection_info, proxy_parent, custom_configuration):
-        super().__init__('SMTP', socket_map, server_address, connection_info, proxy_parent, custom_configuration)
+    def __init__(self, connection_socket, socket_map, proxy_parent, custom_configuration):
+        super().__init__('SMTP', connection_socket, socket_map, proxy_parent, custom_configuration)
         self.ehlo = None
         if self.custom_configuration['starttls']:
             self.starttls_state = self.STARTTLS.PENDING
@@ -1892,26 +1984,26 @@ class OAuth2Proxy(asyncore.dispatcher):
         else:
             Log.debug('Ignoring incoming connection to', self.info_string(), '- no connection information')
 
-    def handle_accepted(self, connection, address):
+    def handle_accepted(self, connection_socket, address):
         if MAX_CONNECTIONS <= 0 or len(self.client_connections) < MAX_CONNECTIONS:
             new_server_connection = None
             try:
-                Log.debug('Accepting new connection to', self.info_string(), 'via', connection.getpeername())
+                Log.debug('Accepting new connection to', self.info_string(), 'from',
+                          Log.format_host_port(connection_socket.getpeername()))
                 socket_map = {}
                 server_class = globals()['%sOAuth2ServerConnection' % self.proxy_type]
-                new_server_connection = server_class(socket_map, self.server_address, address, self,
-                                                     self.custom_configuration)
+                new_server_connection = server_class(connection_socket, socket_map, self, self.custom_configuration)
                 client_class = globals()['%sOAuth2ClientConnection' % self.proxy_type]
-                new_client_connection = client_class(connection, socket_map, address, new_server_connection, self,
-                                                     self.custom_configuration)
+                new_client_connection = client_class(connection_socket, socket_map, self, self.custom_configuration)
                 new_server_connection.client_connection = new_client_connection
+                new_client_connection.server_connection = new_server_connection
                 self.client_connections.append(new_client_connection)
 
                 threading.Thread(target=OAuth2Proxy.run_server, args=(new_client_connection, socket_map),
                                  name='EmailOAuth2Proxy-connection-%d' % address[1], daemon=True).start()
 
             except Exception:
-                connection.close()
+                connection_socket.close()
                 if new_server_connection:
                     new_server_connection.close()
                 raise
@@ -1919,8 +2011,8 @@ class OAuth2Proxy(asyncore.dispatcher):
             error_text = '%s rejecting new connection above MAX_CONNECTIONS limit of %d' % (
                 self.info_string(), MAX_CONNECTIONS)
             Log.error(error_text)
-            connection.send(b'%s\r\n' % self.bye_message(error_text).encode('utf-8'))
-            connection.close()
+            connection_socket.send(b'%s\r\n' % self.bye_message(error_text).encode('utf-8'))
+            connection_socket.close()
 
     @staticmethod
     def run_server(client, socket_map):
@@ -2188,8 +2280,7 @@ class App:
         self.args = parser.parse_args()
 
         Log.initialise(self.args.log_file)
-        if self.args.debug:
-            Log.set_level(logging.DEBUG)
+        self.toggle_debug(self.args.debug, log_message=False)
 
         if self.args.config_file:
             CONFIG_FILE_PATH = CACHE_STORE = self.args.config_file
@@ -2263,6 +2354,7 @@ class App:
             PyObjCTools.MachSignals.signal(signal.SIGTERM, lambda _signum: self.exit(self.icon))
             PyObjCTools.MachSignals.signal(signal.SIGQUIT, lambda _signum: self.exit(self.icon))
             PyObjCTools.MachSignals.signal(signal.SIGHUP, lambda _signum: self.load_and_start_servers(self.icon))
+            PyObjCTools.MachSignals.signal(signal.SIGUSR1, lambda _: self.toggle_debug(Log.get_level() == logging.INFO))
 
         else:
             # for other platforms, or in no-GUI mode, just try to exit gracefully if SIGINT/SIGTERM/SIGQUIT is received
@@ -2274,6 +2366,10 @@ class App:
                 # allow config file reloading without having to stop/start - e.g.: pkill -SIGHUP -f emailproxy.py
                 # (we don't use linux_restart() here as it exits then uses nohup to restart, which may not be desirable)
                 signal.signal(signal.SIGHUP, lambda _signum, _frame: self.load_and_start_servers(self.icon))
+            if hasattr(signal, 'SIGUSR1'):
+                # use SIGUSR1 as a toggle for debug mode (e.g.: pkill -USR1 -f emailproxy.py) - please note that the
+                # proxy's handling of this signal may change in future if other actions are seen as more suitable
+                signal.signal(signal.SIGUSR1, lambda _signum, _fr: self.toggle_debug(Log.get_level() == logging.INFO))
 
     # noinspection PyUnresolvedReferences,PyAttributeOutsideInit
     def macos_nsworkspace_notification_listener_(self, notification):
@@ -2290,26 +2386,46 @@ class App:
             Log.info('Received power off notification; exiting', APP_NAME)
             self.exit(self.icon)
 
+    # noinspection PyDeprecation
     def create_icon(self):
-        Image.ANTIALIAS = Image.LANCZOS  # temporary fix for pystray incompatibility with PIL >= 10.0.0
+        # temporary fix for pystray <= 0.19.4 incompatibility with PIL 10.0.0+; fixed once pystray PR #147 is released
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', DeprecationWarning)
+            pystray_version = pkg_resources.get_distribution('pystray').version
+            pillow_version = pkg_resources.get_distribution('pillow').version
+            if pkg_resources.parse_version(pystray_version) <= pkg_resources.parse_version('0.19.4') and \
+                    pkg_resources.parse_version(pillow_version) >= pkg_resources.parse_version('10.0.0'):
+                Image.ANTIALIAS = Image.LANCZOS
         icon_class = RetinaIcon if sys.platform == 'darwin' else pystray.Icon
         return icon_class(APP_NAME, App.get_image(), APP_NAME, menu=pystray.Menu(
             pystray.MenuItem('Servers and accounts', pystray.Menu(self.create_config_menu)),
             pystray.MenuItem('Authorise account', pystray.Menu(self.create_authorisation_menu)),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem('Start at login', self.toggle_start_at_login, checked=self.started_at_login),
-            pystray.MenuItem('Debug mode', self.toggle_debug, checked=lambda _: Log.get_level() == logging.DEBUG),
+            pystray.MenuItem('Debug mode', lambda _, item: self.toggle_debug(not item.checked),
+                             checked=lambda _: Log.get_level() == logging.DEBUG),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem('Quit %s' % APP_NAME, self.exit)))
 
     @staticmethod
     def get_image():
         # we use an icon font for better multiplatform compatibility and icon size flexibility
-        icon_colour = 'white'  # note: value is irrelevant on macOS - we set as a template to get the platform's colours
+        icon_colour = 'white'  # see below: colour is handled differently per-platform
         icon_character = 'e'
         icon_background_width = 44
         icon_background_height = 44
         icon_width = 40  # to allow for padding between icon and background image size
+
+        # the colour value is irrelevant on macOS - we configure the menu bar icon as a template to get the platform's
+        # colours - but on Windows (and in future potentially Linux) we need to set based on the current theme type
+        if sys.platform == 'win32':
+            import winreg
+            try:
+                key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                     r'Software\Microsoft\Windows\CurrentVersion\Themes\Personalize')
+                icon_colour = 'black' if winreg.QueryValueEx(key, 'SystemUsesLightTheme')[0] else 'white'
+            except FileNotFoundError:
+                pass
 
         # find the largest font size that will let us draw the icon within the available width
         minimum_font_size = 1
@@ -2363,7 +2479,7 @@ class App:
         if len(config_accounts) <= 0:
             items.append(pystray.MenuItem('    No accounts configured', None, enabled=False))
         else:
-            catch_all_enabled = AppConfig.globals().getboolean('allow_catch_all_accounts', fallback=False)
+            catch_all_enabled = AppConfig.get_global('allow_catch_all_accounts', fallback=False)
             catch_all_accounts = []
             for account in config_accounts:
                 if account.startswith('@') and catch_all_enabled:
@@ -2702,9 +2818,12 @@ class App:
 
         return False
 
-    @staticmethod
-    def toggle_debug(_, item):
-        Log.set_level(logging.INFO if item.checked else logging.DEBUG)
+    def toggle_debug(self, enable_debug_mode, log_message=True):
+        Log.set_level(logging.DEBUG if enable_debug_mode else logging.INFO)
+        if log_message:
+            Log.info('Setting debug mode:', Log.get_level() == logging.DEBUG)
+        if hasattr(self, 'icon') and self.icon:
+            self.icon.update_menu()
 
     # noinspection PyUnresolvedReferences
     def notify(self, title, text):
@@ -2752,8 +2871,12 @@ class App:
     def load_and_start_servers(self, icon=None, reload=True):
         # we allow reloading, so must first stop any existing servers
         self.stop_servers()
-        Log.info('Initialising', APP_NAME, '(version %s)' % __version__, 'from config file', CONFIG_FILE_PATH)
-        config = AppConfig.reload() if reload else AppConfig.get()
+        Log.info('Initialising', APP_NAME,
+                 '(version %s)%s' % (__version__, ' in debug mode' if Log.get_level() == logging.DEBUG else ''),
+                 'from config file', CONFIG_FILE_PATH)
+        if reload:
+            AppConfig.unload()
+        config = AppConfig.get()
 
         # load server types and configurations
         server_load_error = False
