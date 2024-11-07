@@ -6,7 +6,7 @@
 __author__ = 'Simon Robinson'
 __copyright__ = 'Copyright (c) 2024 Simon Robinson'
 __license__ = 'Apache 2.0'
-__version__ = '2024-01-20'  # ISO 8601 (YYYY-MM-DD)
+__version__ = '2024-11-06'  # ISO 8601 (YYYY-MM-DD)
 __package_version__ = '.'.join([str(int(i)) for i in __version__.split('-')])  # for pyproject.toml usage only
 
 import abc
@@ -99,13 +99,21 @@ try:
 except ImportError as gui_requirement_import_error:
     MISSING_GUI_REQUIREMENTS.append(gui_requirement_import_error)
 
-with warnings.catch_warnings():
-    warnings.simplefilter('ignore', DeprecationWarning)
+try:
+    # pylint: disable-next=ungrouped-imports
+    import importlib.metadata as importlib_metadata  # get package version numbers - available in stdlib from python 3.8
+except ImportError:
     try:
-        # noinspection PyDeprecation,PyUnresolvedReferences
-        import pkg_resources  # from setuptools - to change to importlib.metadata and packaging.version once min. is 3.8
+        # noinspection PyUnresolvedReferences
+        import importlib_metadata
     except ImportError as gui_requirement_import_error:
         MISSING_GUI_REQUIREMENTS.append(gui_requirement_import_error)
+
+try:
+    # noinspection PyUnresolvedReferences
+    import packaging.version  # parse package version numbers - used to work around various GUI-only package issues
+except ImportError as gui_requirement_import_error:
+    MISSING_GUI_REQUIREMENTS.append(gui_requirement_import_error)
 
 # for macOS-specific functionality
 if sys.platform == 'darwin':
@@ -176,6 +184,7 @@ LINE_TERMINATOR_LENGTH = len(LINE_TERMINATOR)
 AUTHENTICATION_TIMEOUT = 600
 
 TOKEN_EXPIRY_MARGIN = 600  # seconds before its expiry to refresh the OAuth 2.0 token
+JWT_LIFETIME = 300  # seconds to add to the current time and use for the `exp` value in JWT certificate credentials
 
 LOG_FILE_MAX_SIZE = 32 * 1024 * 1024  # when using a log file, its maximum size in bytes before rollover (0 = no limit)
 LOG_FILE_MAX_BACKUPS = 10  # the number of log files to keep when LOG_FILE_MAX_SIZE is exceeded (0 = disable rollover)
@@ -318,7 +327,7 @@ class Log:
         host, port, *_ = address
         with contextlib.suppress(ValueError):
             ip = ipaddress.ip_address(host)
-            host = '[%s]' % host if type(ip) is ipaddress.IPv6Address else host
+            host = '[%s]' % host if isinstance(ip, ipaddress.IPv6Address) else host
         return '%s:%d' % (host, port)
 
     @staticmethod
@@ -355,13 +364,13 @@ class AWSSecretsManagerCacheStore(CacheStore):
         except ModuleNotFoundError:
             Log.error('Unable to load AWS SDK - please install the `boto3` module: `python -m pip install boto3`')
             return None, None
-        else:
-            # allow a profile to be chosen by prefixing the store_id - the separator used (`||`) will not be in an ARN
-            # or secret name (see: https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_CreateSecret.html)
-            split_id = store_id.split('||', maxsplit=1)
-            if '||' in store_id:
-                return split_id[1], boto3.session.Session(profile_name=split_id[0]).client('secretsmanager')
-            return store_id, boto3.client(service_name='secretsmanager')
+
+        # allow a profile to be chosen by prefixing the store_id - the separator used (`||`) will not be in an ARN
+        # or secret name (see: https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_CreateSecret.html)
+        split_id = store_id.split('||', maxsplit=1)
+        if '||' in store_id:
+            return split_id[1], boto3.session.Session(profile_name=split_id[0]).client('secretsmanager')
+        return store_id, boto3.client(service_name='secretsmanager')
 
     @staticmethod
     def _create_secret(aws_client, store_id):
@@ -713,14 +722,15 @@ class OAuth2Helper:
         client_secret = AppConfig.get_option_with_catch_all_fallback(config, username, 'client_secret')
         client_secret_encrypted = AppConfig.get_option_with_catch_all_fallback(config, username,
                                                                                'client_secret_encrypted')
+        jwt_certificate_path = AppConfig.get_option_with_catch_all_fallback(config, username, 'jwt_certificate_path')
+        jwt_key_path = AppConfig.get_option_with_catch_all_fallback(config, username, 'jwt_key_path')
 
-        # note that we don't require permission_url here because it is not needed for the client credentials grant flow,
-        # and likewise for client_secret here because it can be optional for Office 365 configurations
-        if not (token_url and oauth2_scope and redirect_uri and client_id):
+        # because the proxy supports a wide range of OAuth 2.0 flows, in addition to the token_url we only mandate the
+        # core parameters that are required by all methods: oauth2_scope and client_id
+        if not (token_url and oauth2_scope and client_id):
             Log.error('Proxy config file entry incomplete for account', username, '- aborting login')
             return (False, '%s: Incomplete config file entry found for account %s - please make sure all required '
-                           'fields are added (permission_url, token_url, oauth2_scope, redirect_uri, client_id '
-                           'and client_secret)' % (APP_NAME, username))
+                           'fields are added (at least token_url, oauth2_scope and client_id)' % (APP_NAME, username))
 
         # while not technically forbidden (RFC 6749, A.1 and A.2), it is highly unlikely the example value is valid
         example_client_value = '*** your'
@@ -766,18 +776,61 @@ class OAuth2Helper:
                     try:
                         client_secret = cryptographer.decrypt(client_secret_encrypted)
                     except InvalidToken as e:  # needed to avoid looping (we don't remove secrets on decryption failure)
-                        Log.error('Invalid password to decrypt', username, 'secret - aborting login:',
-                                  Log.error_string(e))
+                        Log.error('Invalid password to decrypt `client_secret_encrypted` for account', username,
+                                  '- aborting login:', Log.error_string(e))
                         return False, '%s: Login failed - the password for account %s is incorrect' % (
                             APP_NAME, username)
                 else:
                     Log.info('Warning: found both `client_secret_encrypted` and `client_secret` for account', username,
-                             ' - the un-encrypted value will be used. Removing the un-encrypted value is recommended')
+                             '- the un-encrypted value will be used. Removing the un-encrypted value is recommended')
+
+            # O365 certificate credentials - see: learn.microsoft.com/entra/identity-platform/certificate-credentials
+            jwt_client_assertion = None
+            if jwt_certificate_path and jwt_key_path:
+                if client_secret or client_secret_encrypted:
+                    client_secret_type = '`client_secret%s`' % ('_encrypted' if client_secret_encrypted else '')
+                    Log.info('Warning: found both certificate credentials and', client_secret_type, 'for account',
+                             username, '- the', client_secret_type, 'value will be used. To use certificate',
+                             'credentials, remove the client secret value')
+
+                else:
+                    try:
+                        # noinspection PyUnresolvedReferences
+                        import jwt
+                    except ImportError:
+                        return False, ('Unable to load jwt, which is a requirement when using certificate credentials '
+                                       '(`jwt_` options). Please run `python -m pip install -r requirements-core.txt`')
+                    import uuid
+                    from cryptography import x509
+                    from cryptography.hazmat.primitives import serialization
+
+                    try:
+                        jwt_now = datetime.datetime.now(datetime.timezone.utc)
+                        jwt_certificate_fingerprint = x509.load_pem_x509_certificate(
+                            pathlib.Path(jwt_certificate_path).read_bytes()).fingerprint(hashes.SHA256())
+                        jwt_client_assertion = jwt.encode(
+                            {
+                                'aud': token_url,
+                                'exp': jwt_now + datetime.timedelta(seconds=JWT_LIFETIME),
+                                'iss': client_id,
+                                'jti': str(uuid.uuid4()),
+                                'nbf': jwt_now,
+                                'sub': client_id
+                            },
+                            serialization.load_pem_private_key(pathlib.Path(jwt_key_path).read_bytes(), password=None),
+                            algorithm='RS256',
+                            headers={
+                                'x5t#S256': base64.urlsafe_b64encode(jwt_certificate_fingerprint).decode('utf-8')
+                            })
+                    except (FileNotFoundError, OSError):  # catch OSError due to GitHub issue 257 (quoted paths)
+                        return (False, 'Unable to create credentials assertion for account %s - please check that the '
+                                       '`jwt_certificate_path` and `jwt_key_path` values are correct' % username)
 
             if access_token or refresh_token:  # if possible, refresh the existing token(s)
                 if not access_token or access_token_expiry - current_time < TOKEN_EXPIRY_MARGIN:
                     if refresh_token:
                         response = OAuth2Helper.refresh_oauth2_access_token(token_url, client_id, client_secret,
+                                                                            jwt_client_assertion, username,
                                                                             cryptographer.decrypt(refresh_token))
 
                         access_token = response['access_token']
@@ -811,18 +864,19 @@ class OAuth2Helper:
                                                                                       redirect_listen_address, username)
 
                     if not success:
-                        Log.info('Authorisation result error for', username, '- aborting login.', auth_result)
+                        Log.info('Authorisation result error for account', username, '- aborting login.', auth_result)
                         return False, '%s: Login failed for account %s: %s' % (APP_NAME, username, auth_result)
 
                 if not oauth2_flow:
-                    Log.error('No `oauth2_flow` value specified for', username, '- aborting login')
+                    Log.error('No `oauth2_flow` value specified for account', username, '- aborting login')
                     return (False, '%s: Incomplete config file entry found for account %s - please make sure an '
                                    '`oauth2_flow` value is specified when using a method that does not require a '
                                    '`permission_url`' % (APP_NAME, username))
 
                 response = OAuth2Helper.get_oauth2_authorisation_tokens(token_url, redirect_uri, client_id,
-                                                                        client_secret, auth_result, oauth2_scope,
-                                                                        oauth2_flow, username, password)
+                                                                        client_secret, jwt_client_assertion,
+                                                                        auth_result, oauth2_scope, oauth2_flow,
+                                                                        username, password)
 
                 if AppConfig.get_global('encrypt_client_secret_on_first_use', fallback=False):
                     if client_secret:
@@ -843,8 +897,9 @@ class OAuth2Helper:
                 if 'refresh_token' in response:
                     config.set(username, 'refresh_token', cryptographer.encrypt(response['refresh_token']))
                 elif permission_url:  # ignore this situation with CCG/ROPCG/service account flows - it is expected
-                    Log.info('Warning: no refresh token returned for', username, '- you will need to re-authenticate',
-                             'each time the access token expires (does your `oauth2_scope` value allow `offline` use?)')
+                    Log.info('Warning: no refresh token returned for account', username, '- you will need to',
+                             're-authenticate each time the access token expires (does your `oauth2_scope` value allow',
+                             '`offline` use?)')
 
                 AppConfig.save()
 
@@ -855,7 +910,7 @@ class OAuth2Helper:
 
         except OAuth2Helper.TokenRefreshError as e:
             # always clear access tokens - can easily request another via the refresh token (with no user interaction)
-            has_access_token = True if config.get(username, 'access_token', fallback=None) else False
+            has_access_token = bool(config.get(username, 'access_token', fallback=None))
             config.remove_option(username, 'access_token')
             config.remove_option(username, 'access_token_expiry')
 
@@ -867,7 +922,7 @@ class OAuth2Helper:
 
             AppConfig.save()
 
-            Log.info('Retrying login due to exception while refreshing OAuth 2.0 tokens for', username,
+            Log.info('Retrying login due to exception while refreshing access token for account', username,
                      '(attempt %d):' % (1 if has_access_token else 2), Log.error_string(e))
             return OAuth2Helper.get_oauth2_credentials(username, password, reload_remote_accounts=False)
 
@@ -884,11 +939,12 @@ class OAuth2Helper:
                 config.remove_option(username, 'refresh_token')
                 AppConfig.save()
 
-                Log.info('Retrying login due to exception while decrypting OAuth 2.0 credentials for', username,
+                Log.info('Retrying login due to exception while decrypting OAuth 2.0 credentials for account', username,
                          '(invalid password):', Log.error_string(e))
                 return OAuth2Helper.get_oauth2_credentials(username, password, reload_remote_accounts=False)
 
-            Log.error('Invalid password to decrypt', username, 'credentials - aborting login:', Log.error_string(e))
+            Log.error('Invalid password to decrypt credentials for account', username, '- aborting login:',
+                      Log.error_string(e))
             return False, '%s: Login failed - the password for account %s is incorrect' % (APP_NAME, username)
 
         except Exception as e:
@@ -897,7 +953,8 @@ class OAuth2Helper:
             # errors: URLError(OSError(50, 'Network is down'))) - access token 400 Bad Request HTTPErrors with messages
             # such as 'authorisation code was already redeemed' are caused by our support for simultaneous requests,
             # and will work from the next request; however, please report an issue if you encounter problems here
-            Log.info('Caught exception while requesting OAuth 2.0 credentials for %s:' % username, Log.error_string(e))
+            Log.info('Caught exception while requesting OAuth 2.0 credentials for account %s:' % username,
+                     Log.error_string(e))
             return False, '%s: Login failed for account %s - please check your internet connection and retry' % (
                 APP_NAME, username)
 
@@ -927,6 +984,7 @@ class OAuth2Helper:
                   Log.format_host_port((parsed_uri.hostname, parsed_port)))
 
         class LoggingWSGIRequestHandler(wsgiref.simple_server.WSGIRequestHandler):
+            # pylint: disable-next=arguments-differ
             def log_message(self, _format_string, *args):
                 Log.debug('Local server auth mode (%s): received authentication response' % Log.format_host_port(
                     (parsed_uri.hostname, parsed_port)), *args)
@@ -1014,7 +1072,7 @@ class OAuth2Helper:
                 # to improve no-GUI mode we also support the use of a local redirection receiver server or terminal
                 # entry to authenticate; this result is a timeout, wsgi request error/failure, or terminal auth ctrl+c
                 if 'expired' in data and data['expired']:
-                    return False, 'No-GUI authorisation request failed or timed out'
+                    return False, 'No-GUI authorisation request failed or timed out for account %s' % data['username']
 
                 if 'local_server_auth' in data:
                     threading.Thread(target=OAuth2Helper.start_redirection_receiver_server, args=(data,),
@@ -1031,21 +1089,25 @@ class OAuth2Helper:
                             authorisation_code = OAuth2Helper.oauth2_url_unescape(response['code'])
                             if authorisation_code:
                                 return True, authorisation_code
-                            return False, 'No OAuth 2.0 authorisation code returned'
+                            return False, 'No OAuth 2.0 authorisation code returned for account %s' % data['username']
                         if 'error' in response:
-                            message = 'OAuth 2.0 authorisation error: %s' % response['error']
+                            message = 'OAuth 2.0 authorisation error for account %s: ' % data['username']
+                            message += response['error']
                             message += '; %s' % response['error_description'] if 'error_description' in response else ''
                             return False, message
-                        return False, 'OAuth 2.0 authorisation response has no code or error message'
-                    return False, 'OAuth 2.0 authorisation response is missing or does not match `redirect_uri`'
+                        return (False, 'OAuth 2.0 authorisation response for account %s has neither code nor error '
+                                       'message' % data['username'])
+                    return (False, 'OAuth 2.0 authorisation response for account %s is missing or does not match'
+                                   '`redirect_uri`' % data['username'])
 
             else:  # not for this thread - put back into queue
                 response_queue_reference.put(data)
                 time.sleep(1)
 
     @staticmethod
-    def get_oauth2_authorisation_tokens(token_url, redirect_uri, client_id, client_secret, authorisation_code,
-                                        oauth2_scope, oauth2_flow, username, password):
+    # pylint: disable-next=too-many-positional-arguments
+    def get_oauth2_authorisation_tokens(token_url, redirect_uri, client_id, client_secret, jwt_client_assertion,
+                                        authorisation_code, oauth2_scope, oauth2_flow, username, password):
         """Requests OAuth 2.0 access and refresh tokens from token_url using the given client_id, client_secret,
         authorisation_code and redirect_uri, returning a dict with 'access_token', 'expires_in', and 'refresh_token'
         on success, or throwing an exception on failure (e.g., HTTP 400)"""
@@ -1057,12 +1119,25 @@ class OAuth2Helper:
                   'redirect_uri': redirect_uri, 'grant_type': oauth2_flow}
         if not client_secret:
             del params['client_secret']  # client secret can be optional for O365, but we don't want a None entry
+
+            # certificate credentials are only used when no client secret is provided
+            if jwt_client_assertion:
+                params['client_assertion_type'] = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer'
+                params['client_assertion'] = jwt_client_assertion
+
+            # CCG flow can fall back to the login password as the client secret (see GitHub #271 discussion)
+            elif oauth2_flow == 'client_credentials' and AppConfig.get_global(
+                    'use_login_password_as_client_credentials_secret', fallback=False):
+                params['client_secret'] = password
+
         if oauth2_flow != 'authorization_code':
             del params['code']  # CCG/ROPCG flows have no code, but we need the scope and (for ROPCG) username+password
             params['scope'] = oauth2_scope
             if oauth2_flow == 'password':
                 params['username'] = username
                 params['password'] = password
+            if not redirect_uri:
+                del params['redirect_uri']  # redirect_uri is not typically required in non-code flows; remove if empty
         try:
             response = urllib.request.urlopen(
                 urllib.request.Request(token_url, data=urllib.parse.urlencode(params).encode('utf-8'),
@@ -1070,7 +1145,7 @@ class OAuth2Helper:
             return json.loads(response)
         except urllib.error.HTTPError as e:
             e.message = json.loads(e.read())
-            Log.debug('Error requesting access token - received invalid response:', e.message)
+            Log.debug('Error requesting access token for account', username, '- received invalid response:', e.message)
             raise e
 
     # noinspection PyUnresolvedReferences
@@ -1079,20 +1154,25 @@ class OAuth2Helper:
         """Requests an authorisation token via a Service Account key (currently Google Cloud only)"""
         import json
         try:
-            import requests
+            import requests  # noqa: F401 - requests is required as the default transport for google-auth
             import google.oauth2.service_account
             import google.auth.transport.requests
-        except ModuleNotFoundError:
-            raise Exception('Unable to load Google Auth SDK - please install the `requests` and `google-auth` modules: '
-                            '`python -m pip install requests google-auth`')
+        except ModuleNotFoundError as e:
+            raise ModuleNotFoundError('Unable to load Google Auth SDK - please install the `requests` and '
+                                      '`google-auth` modules: `python -m pip install requests google-auth`') from e
 
         if key_type == 'file':
-            with open(key_path_or_contents) as key_file:
-                service_account = json.load(key_file)
+            try:
+                with open(key_path_or_contents, mode='r', encoding='utf-8') as key_file:
+                    service_account = json.load(key_file)
+            except IOError as e:
+                raise FileNotFoundError('Unable to open service account key file %s for account %s' %
+                                        (key_path_or_contents, username)) from e
         elif key_type == 'key':
             service_account = json.loads(key_path_or_contents)
         else:
-            raise Exception('Service account key type not specified - `client_id` must be set to `file` or `key`')
+            raise KeyError('Service account key type not specified for account %s - `client_id` must be set to '
+                           '`file` or `key`' % username)
 
         credentials = google.oauth2.service_account.Credentials.from_service_account_info(service_account)
         credentials = credentials.with_scopes(oauth2_scope.split(' '))
@@ -1103,21 +1183,32 @@ class OAuth2Helper:
         return {'access_token': credentials.token, 'expires_in': int(credentials.expiry.timestamp() - time.time())}
 
     @staticmethod
-    def refresh_oauth2_access_token(token_url, client_id, client_secret, refresh_token):
+    # pylint: disable-next=too-many-positional-arguments
+    def refresh_oauth2_access_token(token_url, client_id, client_secret, jwt_client_assertion, username, refresh_token):
         """Obtains a new access token from token_url using the given client_id, client_secret and refresh token,
         returning a dict with 'access_token', 'expires_in', and 'refresh_token' on success; exception on failure"""
         params = {'client_id': client_id, 'client_secret': client_secret, 'refresh_token': refresh_token,
                   'grant_type': 'refresh_token'}
         if not client_secret:
             del params['client_secret']  # client secret can be optional for O365, but we don't want a None entry
+
+            # certificate credentials are only used when no client secret is provided
+            if jwt_client_assertion:
+                params['client_assertion_type'] = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer'
+                params['client_assertion'] = jwt_client_assertion
+
         try:
             response = urllib.request.urlopen(
                 urllib.request.Request(token_url, data=urllib.parse.urlencode(params).encode('utf-8'),
                                        headers={'User-Agent': APP_NAME}), timeout=AUTHENTICATION_TIMEOUT).read()
-            return json.loads(response)
+            token = json.loads(response)
+            if 'expires_in' in token:  # some servers return integer values as strings - fix expiry values (GitHub #237)
+                token['expires_in'] = int(token['expires_in'])
+            return token
+
         except urllib.error.HTTPError as e:
             e.message = json.loads(e.read())
-            Log.debug('Error refreshing access token - received invalid response:', e.message)
+            Log.debug('Error refreshing access token for account', username, '- received invalid response:', e.message)
             if e.code == 400:  # 400 Bad Request typically means re-authentication is required (token expired)
                 raise OAuth2Helper.TokenRefreshError from e
             raise e
@@ -1268,15 +1359,16 @@ class SSLAsyncoreDispatcher(asyncore.dispatcher_with_send):
             # APP_PACKAGE is used when we throw our own SSLError on handshake timeout or socket misconfiguration
             ssl_errors = ['SSLV3_ALERT_BAD_CERTIFICATE', 'PEER_DID_NOT_RETURN_A_CERTIFICATE', 'WRONG_VERSION_NUMBER',
                           'CERTIFICATE_VERIFY_FAILED', 'TLSV1_ALERT_PROTOCOL_VERSION', 'TLSV1_ALERT_UNKNOWN_CA',
-                          'UNSUPPORTED_PROTOCOL', APP_PACKAGE]
+                          'UNSUPPORTED_PROTOCOL', 'record layer failure', APP_PACKAGE]
             error_type, value = Log.get_last_error()
-            if error_type == OSError and value.errno == 0 or issubclass(error_type, ssl.SSLError) and \
-                    any(i in value.args[1] for i in ssl_errors):
+            if error_type is OSError and value.errno == 0 or issubclass(error_type, ssl.SSLError) and \
+                    any(i in value.args[1] for i in ssl_errors) or error_type is FileNotFoundError:
                 Log.error('Caught connection error in', self.info_string(), ':', error_type, 'with message:', value)
                 if hasattr(self, 'custom_configuration') and hasattr(self, 'proxy_type'):
                     if self.proxy_type == 'SMTP':
-                        Log.error('Is the server\'s `starttls` setting correct? Current value: %s' %
-                                  self.custom_configuration['starttls'])
+                        Log.error('Are the server\'s `local_starttls` and `server_starttls` settings correct?',
+                                  'Current `local_starttls` value: %s;' % self.custom_configuration['local_starttls'],
+                                  'current `server_starttls` value:', self.custom_configuration['server_starttls'])
                     if self.custom_configuration['local_certificate_path'] and \
                             self.custom_configuration['local_key_path']:
                         Log.error('You have set `local_certificate_path` and `local_key_path`: is your client using a',
@@ -1295,6 +1387,7 @@ class OAuth2ClientConnection(SSLAsyncoreDispatcher):
     """The base client-side connection that is subclassed to handle IMAP/POP/SMTP client interaction (note that there
     is some protocol-specific code in here, but it is not essential, and only used to avoid logging credentials)"""
 
+    # pylint: disable-next=too-many-positional-arguments
     def __init__(self, proxy_type, connection_socket, socket_map, proxy_parent, custom_configuration):
         SSLAsyncoreDispatcher.__init__(self, connection_socket=connection_socket, socket_map=socket_map)
         self.receive_buffer = b''
@@ -1311,7 +1404,8 @@ class OAuth2ClientConnection(SSLAsyncoreDispatcher):
         self.authenticated = False
 
         self.set_ssl_connection(
-            bool(custom_configuration['local_certificate_path'] and custom_configuration['local_key_path']))
+            bool(not custom_configuration['local_starttls'] and custom_configuration['local_certificate_path'] and
+                 custom_configuration['local_key_path']))
 
     def info_string(self):
         debug_string = self.debug_address_string if Log.get_level() == logging.DEBUG else \
@@ -1394,7 +1488,7 @@ class OAuth2ClientConnection(SSLAsyncoreDispatcher):
         error_type, value = Log.get_last_error()
         if error_type and value:
             message = 'Caught connection error (client)'
-            if error_type == ConnectionResetError:
+            if error_type is ConnectionResetError:
                 message = '%s [ Are you attempting an encrypted connection to a non-encrypted server? ]' % message
             Log.info(self.info_string(), message, '-', error_type.__name__, ':', value)
         self.close()
@@ -1417,10 +1511,16 @@ class IMAPOAuth2ClientConnection(OAuth2ClientConnection):
     def __init__(self, connection_socket, socket_map, proxy_parent, custom_configuration):
         super().__init__('IMAP', connection_socket, socket_map, proxy_parent, custom_configuration)
         self.authentication_tag = None
+        (self.authentication_command, self.awaiting_credentials, self.login_literal_length_awaited,
+         self.login_literal_username) = self.reset_login_state()
+
+    def reset_login_state(self):
         self.authentication_command = None
         self.awaiting_credentials = False
         self.login_literal_length_awaited = 0
         self.login_literal_username = None
+        return (self.authentication_command, self.awaiting_credentials, self.login_literal_length_awaited,
+                self.login_literal_username)  # avoid lint complaint about defining outside init
 
     def process_data(self, byte_data, censor_server_log=False):
         str_data = byte_data.decode('utf-8', 'replace').rstrip('\r\n')
@@ -1525,11 +1625,11 @@ class IMAPOAuth2ClientConnection(OAuth2ClientConnection):
             if self.server_connection:
                 self.server_connection.authenticated_username = username
 
-        else:
+        self.reset_login_state()
+        if not success:
             error_message = '%s NO %s %s\r\n' % (self.authentication_tag, command.upper(), result)
+            self.authentication_tag = None
             self.send(error_message.encode('utf-8'))
-            self.send(b'* BYE Autologout; authentication failed\r\n')
-            self.close()
 
 
 class POPOAuth2ClientConnection(OAuth2ClientConnection):
@@ -1605,8 +1705,10 @@ class POPOAuth2ClientConnection(OAuth2ClientConnection):
             self.connection_state = self.STATE.XOAUTH2_AWAITING_CONFIRMATION
             super().process_data(b'AUTH XOAUTH2\r\n')
         else:
+            self.server_connection.username = None
+            self.server_connection.password = None
+            self.connection_state = self.STATE.PENDING
             self.send(b'-ERR Authentication failed.\r\n')
-            self.close()
 
 
 class SMTPOAuth2ClientConnection(OAuth2ClientConnection):
@@ -1615,11 +1717,12 @@ class SMTPOAuth2ClientConnection(OAuth2ClientConnection):
     class STATE(enum.Enum):
         PENDING = 1
         EHLO_AWAITING_RESPONSE = 2
-        AUTH_PLAIN_AWAITING_CREDENTIALS = 3
-        AUTH_LOGIN_AWAITING_USERNAME = 4
-        AUTH_LOGIN_AWAITING_PASSWORD = 5
-        XOAUTH2_AWAITING_CONFIRMATION = 6
-        XOAUTH2_CREDENTIALS_SENT = 7
+        LOCAL_STARTTLS_AWAITING_CONFIRMATION = 3
+        AUTH_PLAIN_AWAITING_CREDENTIALS = 4
+        AUTH_LOGIN_AWAITING_USERNAME = 5
+        AUTH_LOGIN_AWAITING_PASSWORD = 6
+        XOAUTH2_AWAITING_CONFIRMATION = 7
+        XOAUTH2_CREDENTIALS_SENT = 8
 
     def __init__(self, connection_socket, socket_map, proxy_parent, custom_configuration):
         super().__init__('SMTP', connection_socket, socket_map, proxy_parent, custom_configuration)
@@ -1629,12 +1732,42 @@ class SMTPOAuth2ClientConnection(OAuth2ClientConnection):
         str_data = byte_data.decode('utf-8', 'replace').rstrip('\r\n')
         str_data_lower = str_data.lower()
 
+        # receiving any data after setting up local STARTTLS means this has succeeded
+        if self.connection_state is self.STATE.LOCAL_STARTTLS_AWAITING_CONFIRMATION:
+            Log.debug(self.info_string(), '[ Successfully negotiated SMTP client STARTTLS connection ]')
+            self.connection_state = self.STATE.PENDING
+
         # intercept EHLO so we can correct capabilities and replay after STARTTLS if needed (in server connection class)
         if self.connection_state is self.STATE.PENDING:
             if str_data_lower.startswith('ehlo') or str_data_lower.startswith('helo'):
                 self.connection_state = self.STATE.EHLO_AWAITING_RESPONSE
                 self.server_connection.ehlo = byte_data  # save the command so we can replay later if needed (STARTTLS)
                 super().process_data(byte_data)  # don't just go to STARTTLS - most servers require EHLO first
+
+            # handle STARTTLS locally if enabled and a certificate is available, or reject the command
+            elif str_data_lower.startswith('starttls'):
+                if self.custom_configuration['local_starttls'] and not self.ssl_connection:
+                    self.set_ssl_connection(True)
+                    self.connection_state = self.STATE.LOCAL_STARTTLS_AWAITING_CONFIRMATION
+                    self.send(b'220 Ready to start TLS\r\n')
+                    ssl_context = ssl.create_default_context(purpose=ssl.Purpose.CLIENT_AUTH)
+                    try:
+                        ssl_context.load_cert_chain(certfile=self.custom_configuration['local_certificate_path'],
+                                                    keyfile=self.custom_configuration['local_key_path'])
+                    except FileNotFoundError as e:
+                        raise FileNotFoundError('Local STARTTLS failed - unable to open `local_certificate_path` '
+                                                'and/or `local_key_path`') from e
+
+                    # suppress_ragged_eofs: see test_ssl.py documentation in https://github.com/python/cpython/pull/5266
+                    self.set_socket(ssl_context.wrap_socket(self.socket, server_side=True, suppress_ragged_eofs=True,
+                                                            do_handshake_on_connect=False))
+                else:
+                    Log.error(self.info_string(), 'Client attempted to begin STARTTLS', (
+                        '- please either disable STARTTLS in your client when using the proxy, or set `local_starttls`'
+                        'and provide a `local_certificate_path` and `local_key_path`' if not self.custom_configuration[
+                            'local_starttls'] else 'again after already completing the STARTTLS process'))
+                    self.send(b'454 STARTTLS not available\r\n')
+                    self.close()
 
             # intercept AUTH PLAIN and AUTH LOGIN to replace with AUTH XOAUTH2
             elif str_data_lower.startswith('auth plain'):
@@ -1690,13 +1823,16 @@ class SMTPOAuth2ClientConnection(OAuth2ClientConnection):
             self.connection_state = self.STATE.XOAUTH2_AWAITING_CONFIRMATION
             super().process_data(b'AUTH XOAUTH2\r\n')
         else:
+            self.server_connection.username = None
+            self.server_connection.password = None
+            self.connection_state = self.STATE.PENDING
             self.send(b'535 5.7.8  Authentication credentials invalid.\r\n')
-            self.close()
 
 
 class OAuth2ServerConnection(SSLAsyncoreDispatcher):
     """The base server-side connection that is subclassed to handle IMAP/POP/SMTP server interaction"""
 
+    # pylint: disable-next=too-many-positional-arguments
     def __init__(self, proxy_type, connection_socket, socket_map, proxy_parent, custom_configuration):
         SSLAsyncoreDispatcher.__init__(self, socket_map=socket_map)  # note: establish connection later due to STARTTLS
         self.receive_buffer = b''
@@ -1712,14 +1848,27 @@ class OAuth2ServerConnection(SSLAsyncoreDispatcher):
         self.authenticated_username = None  # used only for showing last activity in the menu
         self.last_activity = 0
 
-        self.create_socket()
-        self.connect(self.server_address)
+        self.create_connection()
 
-    def create_socket(self, socket_family=socket.AF_UNSPEC, socket_type=socket.SOCK_STREAM):
-        # connect to whichever resolved IPv4 or IPv6 address is returned first by the system
-        for a in socket.getaddrinfo(self.server_address[0], self.server_address[1], socket_family, socket.SOCK_STREAM):
-            super().create_socket(a[0], socket.SOCK_STREAM)
-            return
+    def create_connection(self):
+        # resolve the given address, then create a socket and connect to each result in turn until one succeeds
+        # noinspection PyTypeChecker
+        for result in socket.getaddrinfo(*self.server_address, socket.AF_UNSPEC, socket.SOCK_STREAM):
+            family, socket_type, _protocol, _canonical_name, socket_address = result
+            try:
+                self.create_socket(family, socket_type)
+                self.connect(socket_address)
+                return
+
+            except OSError as e:
+                self.del_channel()
+                if self.socket is not None:
+                    self.socket.close()
+                socket_type = ' IPv4' if family == socket.AF_INET else ' IPv6' if family == socket.AF_INET6 else ''
+                Log.debug(self.info_string(), 'Unable to create%s socket' % socket_type, 'from getaddrinfo result',
+                          result, '-', Log.error_string(e))
+
+        raise socket.gaierror(8, 'All socket creation attempts failed - unable to resolve host')
 
     def info_string(self):
         debug_string = self.debug_address_string if Log.get_level() == logging.DEBUG else \
@@ -1731,13 +1880,12 @@ class OAuth2ServerConnection(SSLAsyncoreDispatcher):
         Log.debug(self.info_string(), '--> [ Client connected ]')
 
         # connections can either be upgraded (wrapped) after setup via the STARTTLS command, or secure from the start
-        if not self.custom_configuration['starttls']:
-            # noinspection PyTypeChecker
+        if not self.custom_configuration['server_starttls']:
+            self.set_ssl_connection(True)
             ssl_context = ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH)
             ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2  # GitHub CodeQL issue 1
             super().set_socket(ssl_context.wrap_socket(self.socket, server_hostname=self.server_address[0],
                                                        suppress_ragged_eofs=True, do_handshake_on_connect=False))
-            self.set_ssl_connection(True)
 
     def handle_read(self):
         byte_data = self.recv(RECEIVE_BUFFER_SIZE)
@@ -1799,9 +1947,9 @@ class OAuth2ServerConnection(SSLAsyncoreDispatcher):
 
     def handle_error(self):
         error_type, value = Log.get_last_error()
-        if error_type == TimeoutError and value.errno == errno.ETIMEDOUT or \
+        if error_type is TimeoutError and value.errno == errno.ETIMEDOUT or \
                 issubclass(error_type, ConnectionError) and value.errno in [errno.ECONNRESET, errno.ECONNREFUSED] or \
-                error_type == OSError and value.errno in [0, errno.ENETDOWN, errno.ENETUNREACH, errno.EHOSTDOWN,
+                error_type is OSError and value.errno in [0, errno.ENETDOWN, errno.ENETUNREACH, errno.EHOSTDOWN,
                                                           errno.EHOSTUNREACH]:
             # TimeoutError 60 = 'Operation timed out'; ConnectionError 54 = 'Connection reset by peer', 61 = 'Connection
             # refused;  OSError 0 = 'Error' (typically network failure), 50 = 'Network is down', 51 = 'Network is
@@ -1821,7 +1969,7 @@ class OAuth2ServerConnection(SSLAsyncoreDispatcher):
         error_type, value = Log.get_last_error()
         if error_type and value:
             message = 'Caught connection error (server)'
-            if error_type == OSError and value.errno in [errno.ENOTCONN, 10057]:
+            if error_type is OSError and value.errno in [errno.ENOTCONN, 10057]:
                 # OSError 57 or 10057 = 'Socket is not connected'
                 message = '%s [ Client attempted to send command without waiting for server greeting ]' % message
             Log.info(self.info_string(), message, '-', error_type.__name__, ':', value)
@@ -1856,6 +2004,7 @@ class IMAPOAuth2ServerConnection(OAuth2ServerConnection):
         if str_response.startswith('%s OK' % self.client_connection.authentication_tag):
             Log.info(self.info_string(), '[ Successfully authenticated IMAP connection - releasing session ]')
             self.client_connection.authenticated = True
+            self.client_connection.authentication_tag = None
         elif str_response.startswith('%s NO' % self.client_connection.authentication_tag):
             super().process_data(byte_data)  # an error occurred - just send to the client and exit
             self.close()
@@ -1873,7 +2022,7 @@ class IMAPOAuth2ServerConnection(OAuth2ServerConnection):
             if not re.search(' SASL-IR', updated_response, re.IGNORECASE):
                 updated_response = updated_response.replace(' AUTH=PLAIN', ' AUTH=PLAIN SASL-IR')
             updated_response = re.sub(' LOGINDISABLED', '', updated_response, count=1, flags=re.IGNORECASE)
-            byte_data = (b'%s\r\n' % updated_response.encode('utf-8'))
+            byte_data = b'%s\r\n' % updated_response.encode('utf-8')
 
         super().process_data(byte_data)
 
@@ -1890,6 +2039,7 @@ class POPOAuth2ServerConnection(OAuth2ServerConnection):
         self.capa = []
         self.username = None
         self.password = None
+        self.auth_error_result = None
 
     def process_data(self, byte_data):
         # note: there is no reason why POP STARTTLS (https://tools.ietf.org/html/rfc2595) couldn't be supported here
@@ -1914,6 +2064,7 @@ class POPOAuth2ServerConnection(OAuth2ServerConnection):
                         if capa_lower == 'user':
                             has_user = True
                         super().process_data(b'%s\r\n' % capa.encode('utf-8'))
+                self.capa = []
 
                 if not has_sasl:
                     super().process_data(b'SASL PLAIN\r\n')
@@ -1930,16 +2081,25 @@ class POPOAuth2ServerConnection(OAuth2ServerConnection):
             if str_data.startswith('+') and self.username and self.password:  # '+ ' = 'please send credentials'
                 success, result = OAuth2Helper.get_oauth2_credentials(self.username, self.password)
                 if success:
-                    self.client_connection.connection_state = POPOAuth2ClientConnection.STATE.XOAUTH2_CREDENTIALS_SENT
+                    # because get_oauth2_credentials blocks, the client could have disconnected, and may no-longer exist
+                    if self.client_connection:
+                        self.client_connection.connection_state = (
+                            POPOAuth2ClientConnection.STATE.XOAUTH2_CREDENTIALS_SENT)
                     self.send(b'%s\r\n' % OAuth2Helper.encode_oauth2_string(result), censor_log=True)
                     self.authenticated_username = self.username
 
                 self.username = None
                 self.password = None
                 if not success:
-                    # a local authentication error occurred - send details to the client and exit
-                    super().process_data(b'-ERR Authentication failed. %s\r\n' % result.encode('utf-8'))
-                    self.close()
+                    # a local authentication error occurred - cancel then (on confirmation) send details to the client
+                    self.send(b'*\r\n')  # RFC 5034, Section 4
+                    self.auth_error_result = result
+
+            elif str_data.startswith('-ERR') and not self.username and not self.password:
+                self.client_connection.connection_state = POPOAuth2ClientConnection.STATE.PENDING
+                error_message = self.auth_error_result if self.auth_error_result else ''
+                self.auth_error_result = None
+                super().process_data(b'-ERR Authentication failed. %s\r\n' % error_message.encode('utf-8'))
 
             else:
                 super().process_data(byte_data)  # an error occurred - just send to the client and exit
@@ -1973,13 +2133,15 @@ class SMTPOAuth2ServerConnection(OAuth2ServerConnection):
     def __init__(self, connection_socket, socket_map, proxy_parent, custom_configuration):
         super().__init__('SMTP', connection_socket, socket_map, proxy_parent, custom_configuration)
         self.ehlo = None
-        if self.custom_configuration['starttls']:
+        self.ehlo_response = ''
+        if self.custom_configuration['server_starttls']:
             self.starttls_state = self.STARTTLS.PENDING
         else:
             self.starttls_state = self.STARTTLS.COMPLETE
 
         self.username = None
         self.password = None
+        self.auth_error_result = None
 
     def process_data(self, byte_data):
         # SMTP setup/authentication involves a little more back-and-forth than IMAP/POP as the default is STARTTLS...
@@ -1987,33 +2149,51 @@ class SMTPOAuth2ServerConnection(OAuth2ServerConnection):
 
         # an EHLO request has been sent - wait for it to complete, then begin STARTTLS if required
         if self.client_connection.connection_state is SMTPOAuth2ClientConnection.STATE.EHLO_AWAITING_RESPONSE:
-            # intercept EHLO response AUTH capabilities and replace with what we can actually do - note that we assume
-            # an AUTH line will be included in the response; if there are any servers for which this is not the case, we
-            # could cache and re-stream as in POP. AUTH command: https://datatracker.ietf.org/doc/html/rfc4954#section-3
-            # and corresponding formal `sasl-mech` syntax: https://tools.ietf.org/html/rfc4422#section-3.1
+            # intercept EHLO response capabilities and replace with what we can actually do (AUTH PLAIN and LOGIN - see
+            # AUTH command: https://datatracker.ietf.org/doc/html/rfc4954#section-3 and corresponding formal `sasl-mech`
+            # syntax: https://tools.ietf.org/html/rfc4422#section-3.1); and, add/remove STARTTLS where needed
+
+            # an error occurred in response the HELO/EHLO command - pass through to the client
+            if not str_data.startswith('250'):
+                super().process_data(byte_data)
+                return
+
+            # a space after 250 signifies the final response to HELO (single line) or EHLO (multiline)
+            ehlo_end = str_data.split('\r\n')[-1].startswith('250 ')
             updated_response = re.sub(r'250([ -])AUTH(?: [A-Z\d_-]{1,20})+', r'250\1AUTH PLAIN LOGIN', str_data,
                                       flags=re.IGNORECASE)
-            updated_response = b'%s\r\n' % updated_response.encode('utf-8')
-            if self.starttls_state is self.STARTTLS.COMPLETE:
-                super().process_data(updated_response)  # (we replay the EHLO command after STARTTLS for that situation)
+            updated_response = re.sub(r'250([ -])STARTTLS(?:\r\n)?', r'', updated_response, flags=re.IGNORECASE)
+            if ehlo_end and self.ehlo.lower().startswith(b'ehlo'):
+                if 'AUTH PLAIN LOGIN' not in self.ehlo_response:
+                    self.ehlo_response += '250-AUTH PLAIN LOGIN\r\n'
+                if self.custom_configuration['local_starttls'] and not self.client_connection.ssl_connection:
+                    self.ehlo_response += '250-STARTTLS\r\n'  # we always remove STARTTLS; re-add if permitted
+            self.ehlo_response += '%s\r\n' % updated_response if updated_response else ''
 
-            if str_data.startswith('250 '):  # space signifies final response to HELO (single line) or EHLO (multiline)
+            if ehlo_end:
                 self.client_connection.connection_state = SMTPOAuth2ClientConnection.STATE.PENDING
                 if self.starttls_state is self.STARTTLS.PENDING:
                     self.send(b'STARTTLS\r\n')
                     self.starttls_state = self.STARTTLS.NEGOTIATING
 
+                elif self.starttls_state is self.STARTTLS.COMPLETE:
+                    # we replay the original EHLO response to the client after server STARTTLS completes
+                    split_response = self.ehlo_response.split('\r\n')
+                    split_response[-1] = split_response[-1].replace('250-', '250 ')  # fix last item if modified
+                    super().process_data('\r\n'.join(split_response).encode('utf-8'))
+                    self.ehlo = None  # only clear on completion - we need to use for any repeat calls
+                self.ehlo_response = ''
+
         elif self.starttls_state is self.STARTTLS.NEGOTIATING:
             if str_data.startswith('220'):
-                # noinspection PyTypeChecker
+                self.set_ssl_connection(True)
                 ssl_context = ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH)
                 ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2  # GitHub CodeQL issue 2
                 super().set_socket(ssl_context.wrap_socket(self.socket, server_hostname=self.server_address[0],
                                                            suppress_ragged_eofs=True, do_handshake_on_connect=False))
-                self.set_ssl_connection(True)
 
                 self.starttls_state = self.STARTTLS.COMPLETE
-                Log.debug(self.info_string(), '[ Successfully negotiated SMTP STARTTLS connection -',
+                Log.debug(self.info_string(), '[ Successfully negotiated SMTP server STARTTLS connection -',
                           're-sending greeting ]')
                 self.client_connection.connection_state = SMTPOAuth2ClientConnection.STATE.EHLO_AWAITING_RESPONSE
                 self.send(self.ehlo)  # re-send original EHLO/HELO to server (includes domain, so can't just be generic)
@@ -2026,17 +2206,28 @@ class SMTPOAuth2ServerConnection(OAuth2ServerConnection):
             if str_data.startswith('334') and self.username and self.password:  # '334 ' = 'please send credentials'
                 success, result = OAuth2Helper.get_oauth2_credentials(self.username, self.password)
                 if success:
-                    self.client_connection.connection_state = SMTPOAuth2ClientConnection.STATE.XOAUTH2_CREDENTIALS_SENT
+                    # because get_oauth2_credentials blocks, the client could have disconnected, and may no-longer exist
+                    if self.client_connection:
+                        self.client_connection.connection_state = (
+                            SMTPOAuth2ClientConnection.STATE.XOAUTH2_CREDENTIALS_SENT)
                     self.authenticated_username = self.username
                     self.send(b'%s\r\n' % OAuth2Helper.encode_oauth2_string(result), censor_log=True)
 
                 self.username = None
                 self.password = None
                 if not success:
-                    # a local authentication error occurred - send details to the client and exit
+                    # a local authentication error occurred - cancel then (on confirmation) send details to the client
+                    self.send(b'*\r\n')  # RFC 4954, Section 4
+                    self.auth_error_result = result
+
+            # note that RFC 4954 says that the server must respond with '501', but some (e.g., Office 365) return '535'
+            elif str_data.startswith('5') and not self.username and not self.password:
+                if len(str_data) >= 4 and str_data[3] == ' ':  # responses may be multiline - wait for last part
+                    self.client_connection.connection_state = SMTPOAuth2ClientConnection.STATE.PENDING
+                    error_message = self.auth_error_result if self.auth_error_result else ''
+                    self.auth_error_result = None
                     super().process_data(
-                        b'535 5.7.8  Authentication credentials invalid. %s\r\n' % result.encode('utf-8'))
-                    self.close()
+                        b'535 5.7.8  Authentication credentials invalid. %s\r\n' % error_message.encode('utf-8'))
 
             else:
                 super().process_data(byte_data)  # an error occurred - just send to the client and exit
@@ -2064,14 +2255,17 @@ class OAuth2Proxy(asyncore.dispatcher):
         self.local_address = local_address
         self.server_address = server_address
         self.custom_configuration = custom_configuration
-        self.ssl_connection = custom_configuration['local_certificate_path'] and custom_configuration['local_key_path']
+        self.ssl_connection = bool(
+            custom_configuration['local_certificate_path'] and custom_configuration['local_key_path'])
         self.client_connections = []
 
     def info_string(self):
         return '%s server at %s (%s) proxying %s (%s)' % (
             self.proxy_type, Log.format_host_port(self.local_address),
-            'TLS' if self.ssl_connection else 'unsecured', Log.format_host_port(self.server_address),
-            'STARTTLS' if self.custom_configuration['starttls'] else 'SSL/TLS')
+            'STARTTLS' if self.custom_configuration[
+                'local_starttls'] else 'SSL/TLS' if self.ssl_connection else 'unsecured',
+            Log.format_host_port(self.server_address),
+            'STARTTLS' if self.custom_configuration['server_starttls'] else 'SSL/TLS')
 
     def handle_accept(self):
         Log.debug('New incoming connection to', self.info_string())
@@ -2143,8 +2337,10 @@ class OAuth2Proxy(asyncore.dispatcher):
             new_socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, False)
         new_socket.setblocking(False)
 
-        if self.ssl_connection:
-            # noinspection PyTypeChecker
+        # we support local connections with and without STARTTLS (currently only for SMTP), so need to either actively
+        # set up SSL, or wait until it is requested (note: self.ssl_connection here indicates whether the connection is
+        # eventually secure, either from the outset or after STARTTLS, and is required primarily for GUI icon purposes)
+        if self.ssl_connection and not self.custom_configuration['local_starttls']:
             ssl_context = ssl.create_default_context(purpose=ssl.Purpose.CLIENT_AUTH)
             try:
                 ssl_context.load_cert_chain(certfile=self.custom_configuration['local_certificate_path'],
@@ -2190,9 +2386,9 @@ class OAuth2Proxy(asyncore.dispatcher):
     def handle_error(self):
         error_type, value = Log.get_last_error()
         if error_type == socket.gaierror and value.errno in [-2, 8, 11001] or \
-                error_type == TimeoutError and value.errno == errno.ETIMEDOUT or \
+                error_type is TimeoutError and value.errno == errno.ETIMEDOUT or \
                 issubclass(error_type, ConnectionError) and value.errno in [errno.ECONNRESET, errno.ECONNREFUSED] or \
-                error_type == OSError and value.errno in [0, errno.EINVAL, errno.ENETDOWN, errno.EHOSTUNREACH]:
+                error_type is OSError and value.errno in [0, errno.EINVAL, errno.ENETDOWN, errno.EHOSTUNREACH]:
             # gaierror -2 or 8 = 'nodename nor servname provided, or not known' / 11001 = 'getaddrinfo failed' (caused
             # by getpeername() failing due to no connection); TimeoutError 60 = 'Operation timed out'; ConnectionError
             # 54 = 'Connection reset by peer', 61 = 'Connection refused; OSError 0 = 'Error' (local SSL failure),
@@ -2228,13 +2424,15 @@ if sys.platform == 'darwin':
         # callbacks, but using that means that window.get_current_url() returns None when the loaded handler is called
         def webView_didStartProvisionalNavigation_(self, web_view, _nav):
             # called when a user action (i.e., clicking our external authorisation mode submit button) redirects locally
-            browser_view_instance = webview.platforms.cocoa.BrowserView.get_instance('webkit', web_view)
+            browser_view_instance = webview.platforms.cocoa.BrowserView.get_instance(
+                ProvisionalNavigationBrowserDelegate.pywebview_attr, web_view)
             if browser_view_instance:
                 browser_view_instance.loaded.set()
 
         def webView_didReceiveServerRedirectForProvisionalNavigation_(self, web_view, _nav):
             # called when the server initiates a local redirect
-            browser_view_instance = webview.platforms.cocoa.BrowserView.get_instance('webkit', web_view)
+            browser_view_instance = webview.platforms.cocoa.BrowserView.get_instance(
+                ProvisionalNavigationBrowserDelegate.pywebview_attr, web_view)
             if browser_view_instance:
                 browser_view_instance.loaded.set()
 
@@ -2244,7 +2442,7 @@ if sys.platform == 'darwin':
                     event.keyCode() == 12 and self.window().firstResponder():
                 self.window().performClose_(event)
                 return True
-            return webview.platforms.cocoa.BrowserView.WebKitHost.performKeyEquivalentBase_(self, event)
+            return False
 
 if sys.platform == 'darwin':
     # noinspection PyUnresolvedReferences
@@ -2409,7 +2607,8 @@ class App:
 
         if self.args.gui and len(MISSING_GUI_REQUIREMENTS) > 0:
             Log.error('Unable to load all GUI requirements:', MISSING_GUI_REQUIREMENTS, '- did you mean to run in',
-                      '`--no-gui` mode? If not, please run `python -m pip install -r requirements-gui.txt`')
+                      '`--no-gui` mode? If not, please run `python -m pip install -r requirements-gui.txt` or install',
+                      'from PyPI with GUI requirements included: `python -m pip install emailproxy[gui]`')
             self.exit(None)
             return
 
@@ -2430,6 +2629,9 @@ class App:
     # noinspection PyUnresolvedReferences,PyAttributeOutsideInit
     def init_platforms(self):
         if sys.platform == 'darwin' and self.args.gui:
+            if len(MISSING_GUI_REQUIREMENTS) > 0:
+                return  # skip - we will exit anyway due to missing requirements (with a more helpful error message)
+
             # hide dock icon (but not LSBackgroundOnly as we need input via webview)
             info = AppKit.NSBundle.mainBundle().infoDictionary()
             info['LSUIElement'] = '1'
@@ -2518,13 +2720,12 @@ class App:
     # noinspection PyDeprecation
     def create_icon(self):
         # fix pystray <= 0.19.4 incompatibility with PIL 10.0.0+; resolved in 0.19.5 and later via pystray PR #147
-        with warnings.catch_warnings():
-            warnings.simplefilter('ignore', DeprecationWarning)
-            pystray_version = pkg_resources.get_distribution('pystray').version
-            pillow_version = pkg_resources.get_distribution('pillow').version
-            if pkg_resources.parse_version(pystray_version) <= pkg_resources.parse_version('0.19.4') and \
-                    pkg_resources.parse_version(pillow_version) >= pkg_resources.parse_version('10.0.0'):
-                Image.ANTIALIAS = Image.LANCZOS
+        pystray_version = packaging.version.Version(importlib_metadata.version('pystray'))
+        pillow_version = packaging.version.Version(importlib_metadata.version('pillow'))
+        if pystray_version <= packaging.version.Version('0.19.4') and \
+                pillow_version >= packaging.version.Version('10.0.0'):
+            Image.ANTIALIAS = Image.LANCZOS if hasattr(Image, 'LANCZOS') else Image.Resampling.LANCZOS
+
         icon_class = RetinaIcon if sys.platform == 'darwin' else pystray.Icon
         return icon_class(APP_NAME, App.get_image(), APP_NAME, menu=pystray.Menu(
             pystray.MenuItem('Servers and accounts', pystray.Menu(self.create_config_menu)),
@@ -2585,9 +2786,8 @@ class App:
         font = ImageFont.truetype(io.BytesIO(zlib.decompress(base64.b64decode(APP_ICON))), size=font_size)
 
         # pillow's getsize method was deprecated in 9.2.0 (see docs for PIL.ImageFont.ImageFont.getsize)
-        # noinspection PyDeprecation
-        if pkg_resources.parse_version(
-                pkg_resources.get_distribution('pillow').version) < pkg_resources.parse_version('9.2.0'):
+        if packaging.version.Version(importlib_metadata.version('pillow')) < packaging.version.Version('9.2.0'):
+            # noinspection PyUnresolvedReferences
             font_width, font_height = font.getsize(text)
             return font, font_width, font_height
 
@@ -2599,9 +2799,9 @@ class App:
         if len(self.proxies) <= 0:
             # note that we don't actually allow no servers when loading the config, so no need to generate a menu
             return items  # (avoids creating and then immediately regenerating the menu when servers are loaded)
-        else:
-            for server_type in ['IMAP', 'POP', 'SMTP']:
-                items.extend(App.get_config_menu_servers(self.proxies, server_type))
+
+        for server_type in ['IMAP', 'POP', 'SMTP']:
+            items.extend(App.get_config_menu_servers(self.proxies, server_type))
 
         config_accounts = AppConfig.accounts()
         items.append(pystray.MenuItem('Accounts (+ last authenticated activity):', None, enabled=False))
@@ -2680,7 +2880,7 @@ class App:
         else:
             usernames = []
             for request in self.authorisation_requests:
-                if not request['username'] in usernames:
+                if request['username'] not in usernames:
                     items.append(pystray.MenuItem(request['username'], self.authorise_account))
                     usernames.append(request['username'])
         items.append(pystray.Menu.SEPARATOR)
@@ -2728,9 +2928,9 @@ class App:
         setattr(authorisation_window, 'get_title', lambda window: window.title)  # add missing get_title method
 
         # pywebview 3.6+ moved window events to a separate namespace in a non-backwards-compatible way
-        # noinspection PyDeprecation
-        if pkg_resources.parse_version(
-                pkg_resources.get_distribution('pywebview').version) < pkg_resources.parse_version('3.6'):
+        pywebview_version = packaging.version.Version(importlib_metadata.version('pywebview'))
+        # the version zero check is due to a bug in the Ubuntu 24.04 python-pywebview package - see GitHub #242
+        if packaging.version.Version('0') < pywebview_version < packaging.version.Version('3.6'):
             # noinspection PyUnresolvedReferences
             authorisation_window.loaded += self.authorisation_window_loaded
         else:
@@ -2744,18 +2944,16 @@ class App:
         # pywebview window can get into a state in which http://localhost navigation, rather than failing, just hangs
         # noinspection PyPackageRequirements
         import webview.platforms.cocoa
+        pywebview_version = packaging.version.Version(importlib_metadata.version('pywebview'))
+        ProvisionalNavigationBrowserDelegate.pywebview_attr = 'webkit' if pywebview_version < packaging.version.Version(
+            '5.3') else 'webview'
         setattr(webview.platforms.cocoa.BrowserView.BrowserDelegate, 'webView_didStartProvisionalNavigation_',
                 ProvisionalNavigationBrowserDelegate.webView_didStartProvisionalNavigation_)
         setattr(webview.platforms.cocoa.BrowserView.BrowserDelegate, 'webView_didReceiveServerRedirectForProvisional'
                                                                      'Navigation_',
                 ProvisionalNavigationBrowserDelegate.webView_didReceiveServerRedirectForProvisionalNavigation_)
-        try:
-            setattr(webview.platforms.cocoa.BrowserView.WebKitHost, 'performKeyEquivalentBase_',
-                    webview.platforms.cocoa.BrowserView.WebKitHost.performKeyEquivalent_)
-            setattr(webview.platforms.cocoa.BrowserView.WebKitHost, 'performKeyEquivalent_',
-                    ProvisionalNavigationBrowserDelegate.performKeyEquivalent_)
-        except TypeError:
-            pass
+        setattr(webview.platforms.cocoa.BrowserView.WebKitHost, 'performKeyEquivalent_',
+                ProvisionalNavigationBrowserDelegate.performKeyEquivalent_)
 
         # also needed only on macOS because otherwise closing the last remaining webview window exits the application
         dummy_window = webview.create_window('%s hidden (dummy) window' % APP_NAME, html='<html></html>', hidden=True)
@@ -2925,10 +3123,10 @@ class App:
             output = subprocess.check_output(['/bin/launchctl', command, proxy_command], stderr=subprocess.STDOUT)
         except subprocess.CalledProcessError:
             return False
-        else:
-            if output and command != 'list':
-                return False  # load/unload gives no output unless unsuccessful (return code is always 0 regardless)
-            return True
+
+        if output and command != 'list':
+            return False  # load/unload gives no output unless unsuccessful (return code is always 0 regardless)
+        return True
 
     @staticmethod
     def started_at_login(_):
@@ -3008,15 +3206,24 @@ class App:
                  'from config file', CONFIG_FILE_PATH)
         if reload:
             AppConfig.unload()
-        config = AppConfig.get()
+
+        config_parse_error = False
+        try:
+            config = AppConfig.get()
+            servers = AppConfig.servers()
+        except configparser.Error as e:
+            Log.error('Unable to load configuration file:', e)
+            config_parse_error = True
+            servers = []
 
         # load server types and configurations
         server_load_error = False
         server_start_error = False
-        for section in AppConfig.servers():
+        for section in servers:
             match = CONFIG_SERVER_MATCHER.match(section)
             server_type = match.group('type')
 
+            # noinspection PyUnboundLocalVariable
             local_address = config.get(section, 'local_address', fallback='::')
             str_local_port = match.group('port')
             local_port = -1
@@ -3035,10 +3242,23 @@ class App:
                 server_load_error = True
 
             custom_configuration = {
-                'starttls': config.getboolean(section, 'starttls', fallback=False) if server_type == 'SMTP' else False,
+                'server_starttls': False,
+                'local_starttls': False,
                 'local_certificate_path': config.get(section, 'local_certificate_path', fallback=None),
                 'local_key_path': config.get(section, 'local_key_path', fallback=None)
             }
+            if server_type == 'SMTP':
+                # initially the STARTTLS setting was remote server only, and hence named just `starttls` - support this
+                legacy_starttls = config.getboolean(section, 'starttls', fallback=False)
+                custom_configuration['server_starttls'] = config.getboolean(section, 'server_starttls',
+                                                                            fallback=legacy_starttls)
+
+                custom_configuration['local_starttls'] = config.getboolean(section, 'local_starttls', fallback=False)
+                if custom_configuration['local_starttls'] and not (custom_configuration['local_certificate_path'] and
+                                                                   custom_configuration['local_key_path']):
+                    Log.error('Error: you have set `local_starttls` but did not provide both '
+                              '`local_certificate_path` and `local_key_path` values in section', match.string)
+                    server_load_error = True
 
             if not server_address:  # all other values are checked, regex matched or have a fallback above
                 Log.error('Error: remote server address is missing in section', match.string)
@@ -3054,15 +3274,15 @@ class App:
                     Log.error('Error: unable to start', match.string, 'server:', Log.error_string(e))
                     server_start_error = True
 
-        if server_start_error or server_load_error or len(self.proxies) <= 0:
+        if config_parse_error or server_start_error or server_load_error or len(self.proxies) <= 0:
             if server_start_error:
                 Log.error('Abandoning setup as one or more servers failed to start - is the proxy already running?')
             else:
-                error_text = 'Invalid' if len(AppConfig.servers()) > 0 else 'No'
-                Log.error(error_text, 'server configuration(s) found in', CONFIG_FILE_PATH, '- exiting')
                 if not os.path.exists(CONFIG_FILE_PATH):
                     Log.error(APP_NAME, 'config file not found - see https://github.com/simonrob/email-oauth2-proxy',
                               'for full documentation and example configurations to help get started')
+                error_text = 'Invalid' if len(servers) > 0 else 'Unparsable' if config_parse_error else 'No'
+                Log.error(error_text, 'server configuration(s) found in', CONFIG_FILE_PATH, '- exiting')
                 self.notify(APP_NAME, error_text + ' server configuration(s) found. ' +
                             'Please verify your account and server details in %s' % CONFIG_FILE_PATH)
             AppConfig.unload()  # so we don't overwrite the invalid file with a blank configuration
@@ -3205,7 +3425,8 @@ class App:
 
         AppConfig.save()
 
-        if sys.platform == 'darwin' and self.args.gui:
+        # attribute existence check is needed here and below because we may exit before init_platforms() has run
+        if sys.platform == 'darwin' and self.args.gui and hasattr(self, 'macos_reachability_target'):
             # noinspection PyUnresolvedReferences
             SystemConfiguration.SCNetworkReachabilityUnscheduleFromRunLoop(self.macos_reachability_target,
                                                                            SystemConfiguration.CFRunLoopGetCurrent(),
@@ -3239,7 +3460,8 @@ class App:
             restart_callback()
 
         # macOS Launch Agents need reloading when changed; unloading exits immediately so this must be our final action
-        if sys.platform == 'darwin' and self.args.gui and self.macos_unload_plist_on_exit:
+        if sys.platform == 'darwin' and self.args.gui and (
+                hasattr(self, 'macos_unload_plist_on_exit') and self.macos_unload_plist_on_exit):
             self.macos_launchctl('unload')
 
 
